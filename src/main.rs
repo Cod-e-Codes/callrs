@@ -61,7 +61,7 @@ impl App {
 
         Self {
             mode: AppMode::Menu,
-            logs: vec!["Welcome to callrs - Robust P2P Audio".into()],
+            logs: vec!["callrs - P2P Voice Chat".into()],
             status: "Ready".into(),
             input: String::new(),
             should_quit: false,
