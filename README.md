@@ -52,3 +52,7 @@ The application uses a simple packet structure:
 
 * First 4 bytes: Little-endian u32 sequence number.
 * Remaining bytes: Raw i16 audio samples in little-endian format.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
