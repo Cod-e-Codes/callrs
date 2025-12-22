@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+
+# IDE / Editor specific files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Environment files
+.env
+
+# OS specific files
+.DS_Store
+Thumbs.db
