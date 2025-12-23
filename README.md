@@ -40,7 +40,7 @@ cargo run
 ## Architecture
 
 *   **Language**: Rust
-*   **Audio**: `cpal` for properties, `audiopus` for standard Opus compression (48kHz), `ringbuf` for buffering
+*   **Audio**: `cpal` (I/O), `audiopus` (Opus compression), `rubato` (resampling), `ringbuf` (lock-free buffering)
 *   **Network**: `webrtc-ice` for NAT traversal, `igd` for UPnP auto-mapping, `tokio` for async UDP
 *   **Interface**: `ratatui` text user interface
 

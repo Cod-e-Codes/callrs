@@ -26,6 +26,8 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+use rubato::{Resampler, SincFixedIn};
+
 use audiopus::{
     Application as OpusApplication, Channels as OpusChannels, SampleRate as OpusSampleRate,
     coder::{Decoder as OpusDecoder, Encoder as OpusEncoder},
@@ -130,6 +132,20 @@ impl AudioHandle {
     }
     fn stop(&self) {
         self.is_active.store(false, Ordering::Relaxed);
+    }
+}
+
+struct CallSession {
+    audio: AudioHandle,
+    capture_task: tokio::task::JoinHandle<()>,
+    network_task: tokio::task::JoinHandle<()>,
+}
+
+impl CallSession {
+    async fn stop(self) {
+        self.capture_task.abort();
+        self.network_task.abort();
+        self.audio.stop();
     }
 }
 
@@ -448,7 +464,7 @@ async fn capture_processor(
     mut capture_cons: HeapCons<f32>,
     network_tx: mpsc::Sender<Vec<u8>>,
     is_active: Arc<AtomicBool>,
-    _sample_rate: u32,
+    sample_rate: u32,
     action_tx: mpsc::Sender<AppAction>,
 ) {
     // Opus Encoder setup
@@ -463,7 +479,39 @@ async fn capture_processor(
     let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_size);
     let mut opus_buf = vec![0u8; 1024];
 
+    // Resampler setup
+    let mut resampler: Option<SincFixedIn<f32>> = if sample_rate != 48000 {
+        let params = rubato::SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: rubato::SincInterpolationType::Linear,
+            window: rubato::WindowFunction::BlackmanHarris2,
+            oversampling_factor: 128,
+        };
+        // Input chunk size: try to approximate 20ms or just use something reasonable like 1024
+        // output_needed ~ 960. ratio = 48000 / sample_rate.
+        let chunk_in = 1024;
+        let ratio = 48000.0 / sample_rate as f64;
+        Some(SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_in, 1).unwrap())
+    } else {
+        None
+    };
+
+    let mut resample_input_buffer: Vec<f32> = Vec::new();
+    let resample_chunk_in = if let Some(r) = &resampler {
+        r.input_frames_next()
+    } else {
+        0
+    };
+
+    // Output buffer for F32 samples (either raw or resampled) waiting to be converted to i16
+    let mut f32_capture_buffer: Vec<f32> = Vec::with_capacity(frame_size * 2);
+
     let mut sequence: u32 = 0;
+
+    // Flow control / Metrics
+    let mut dropped_packets = 0u64;
+    let mut last_drop_log = std::time::Instant::now();
 
     // For volume calculation
     let mut vol_sum = 0.0;
@@ -476,34 +524,74 @@ async fn capture_processor(
             continue;
         }
 
-        while capture_cons.occupied_len() >= frame_size {
-            for _ in 0..frame_size {
-                let sample = capture_cons.try_pop().unwrap_or(0.0);
+        // 1. Drain ringbuf
+        while let Some(sample) = capture_cons.try_pop() {
+            if resampler.is_some() {
+                resample_input_buffer.push(sample);
+            } else {
+                f32_capture_buffer.push(sample);
+            }
+        }
 
+        // 2. Run Resampler if needed
+        if let Some(r) = &mut resampler {
+            while resample_input_buffer.len() >= resample_chunk_in {
+                let chunk: Vec<f32> = resample_input_buffer.drain(0..resample_chunk_in).collect();
+                // SincFixedIn expects Vec<Vec<f32>> for channels
+                match r.process(&[chunk], None) {
+                    Ok(output) => {
+                        // output[0] is channel 0
+                        if let Some(chan0) = output.first() {
+                            f32_capture_buffer.extend_from_slice(chan0);
+                        }
+                    }
+                    Err(e) => {
+                        let _ =
+                            action_tx.try_send(AppAction::Log(format!("Resample error: {:?}", e)));
+                    }
+                }
+            }
+        }
+
+        // 3. Process F32 buffer into Opus Frames
+        while f32_capture_buffer.len() >= frame_size {
+            // Take exactly frame_size
+            let frame_samples: Vec<f32> = f32_capture_buffer.drain(0..frame_size).collect();
+
+            // Calc volume & Convert to i16
+            for sample in frame_samples {
                 vol_sum += sample.abs();
                 vol_count += 1;
-
-                if vol_count >= frame_size {
-                    let avg = vol_sum / vol_count as f32;
-                    let vol_normalized = (avg * 5.0).clamp(0.0, 1.0);
-                    if last_vol_update.elapsed().as_millis() > 50 {
-                        let _ = action_tx.try_send(AppAction::SetMicVolume(vol_normalized));
-                        last_vol_update = std::time::Instant::now();
-                    }
-                    vol_sum = 0.0;
-                    vol_count = 0;
-                }
 
                 let s_i16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
                 pcm_buf.push(s_i16);
             }
 
+            // Volume Update
+            if vol_count >= frame_size {
+                let avg = vol_sum / vol_count as f32;
+                let vol_normalized = (avg * 5.0).clamp(0.0, 1.0);
+                if last_vol_update.elapsed().as_millis() > 50 {
+                    let _ = action_tx.try_send(AppAction::SetMicVolume(vol_normalized));
+                    last_vol_update = std::time::Instant::now();
+                }
+                vol_sum = 0.0;
+                vol_count = 0;
+            }
+
+            // Encode
             match encoder.encode(&pcm_buf, &mut opus_buf) {
                 Ok(len) => {
                     let mut packet = Vec::with_capacity(4 + len);
                     packet.extend_from_slice(&sequence.to_le_bytes());
                     packet.extend_from_slice(&opus_buf[..len]);
-                    let _ = network_tx.try_send(packet);
+
+                    match network_tx.try_send(packet) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            dropped_packets += 1;
+                        }
+                    }
                     sequence = sequence.wrapping_add(1);
                 }
                 Err(e) => {
@@ -513,7 +601,18 @@ async fn capture_processor(
             }
             pcm_buf.clear();
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Log drops
+        if dropped_packets > 0 && last_drop_log.elapsed().as_secs() >= 5 {
+            let _ = action_tx.try_send(AppAction::Log(format!(
+                "Warning: Dropped {} TX packets (backpressure)",
+                dropped_packets
+            )));
+            dropped_packets = 0;
+            last_drop_log = std::time::Instant::now();
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -538,7 +637,19 @@ async fn run_network(
         .send(AppAction::Log("ICE Connected!".into()))
         .await;
 
+    let mut dropped_frames = 0u64;
+    let mut last_drop_log = std::time::Instant::now();
+
     loop {
+        // Log drops
+        if dropped_frames > 0 && last_drop_log.elapsed().as_secs() >= 5 {
+            let _ = action_tx.try_send(AppAction::Log(format!(
+                "Warning: Dropped {} RX frames (playback buffer full)",
+                dropped_frames
+            )));
+            dropped_frames = 0;
+            last_drop_log = std::time::Instant::now();
+        }
         tokio::select! {
             Some(data) = network_rx.recv() => {
                 if let Err(e) = conn.send(&data).await {
@@ -568,12 +679,15 @@ async fn run_network(
 
                                     // Basic buffer overflow protection
                                     if playback_prod.occupied_len() > 9600 {
+                                        dropped_frames += samples_len as u64;
                                         continue;
                                     }
 
                                     for &s in &decoded_pcm[..samples_len] {
                                         let s_f32 = s as f32 / 32768.0;
-                                        let _ = playback_prod.try_push(s_f32);
+                                        if playback_prod.try_push(s_f32).is_err() {
+                                            dropped_frames += 1;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -711,11 +825,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (mut net_task, mut cap_task, mut audio_handle): (
-        Option<tokio::task::JoinHandle<()>>,
-        Option<tokio::task::JoinHandle<()>>,
-        Option<AudioHandle>,
-    ) = (None, None, None);
+    let mut session: Option<CallSession> = None;
 
     loop {
         terminal.draw(|f| render_ui(f, &app))?;
@@ -746,25 +856,28 @@ async fn main() -> Result<()> {
                     if let Ok(audio) = setup_audio(cap_prod, play_cons) {
                         audio.start();
 
-                        // Store the handles!
-                        cap_task = Some(tokio::spawn(capture_processor(
+                        let cap_task = tokio::spawn(capture_processor(
                             cap_cons,
                             ntx,
                             audio.is_active.clone(),
                             audio.sample_rate,
                             action_tx.clone(),
-                        )));
+                        ));
 
-                        net_task = Some(tokio::spawn(run_network(
+                        let net_task = tokio::spawn(run_network(
                             conn,
                             nrx,
                             play_prod,
                             action_tx.clone(),
                             audio.is_active.clone(),
                             audio.sample_rate,
-                        )));
+                        ));
 
-                        audio_handle = Some(audio);
+                        session = Some(CallSession {
+                            audio,
+                            capture_task: cap_task,
+                            network_task: net_task,
+                        });
 
                         app.mode = AppMode::InCall("Connected".into());
                     }
@@ -997,14 +1110,8 @@ async fn main() -> Result<()> {
 
                         // ESC to cancel/end
                         (_, KeyCode::Esc) => {
-                            if let Some(t) = net_task.take() {
-                                t.abort();
-                            }
-                            if let Some(t) = cap_task.take() {
-                                t.abort();
-                            }
-                            if let Some(a) = audio_handle.take() {
-                                a.stop();
+                            if let Some(s) = session.take() {
+                                s.stop().await;
                             }
                             app.host_agent_handle = None;
 
