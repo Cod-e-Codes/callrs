@@ -219,9 +219,19 @@ use webrtc_ice::{
 async fn create_ice_agent() -> Result<Agent> {
     let stun_url = Url::parse_url("stun:stun.l.google.com:19302")?;
 
+    // Create a UDP Multiplexer binding to port 9090
+    // This forces all ICE traffic to use this port, matching our UPnP mapping.
+    let udp_socket = tokio::net::UdpSocket::bind("0.0.0.0:9090")
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind to port 9090: {}", e))?;
+
+    let mux =
+        webrtc_ice::udp_mux::UDPMuxDefault::new(webrtc_ice::udp_mux::UDPMuxParams::new(udp_socket));
+
     let config = AgentConfig {
         network_types: vec![NetworkType::Udp4, NetworkType::Udp6],
         urls: vec![stun_url],
+        udp_network: webrtc_ice::udp_network::UDPNetwork::Muxed(mux),
         ..Default::default()
     };
 
