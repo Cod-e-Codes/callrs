@@ -618,7 +618,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " CALLRS-ICE ",
+                " CALLRS ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
