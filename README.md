@@ -41,7 +41,7 @@ cargo run
 
 *   **Language**: Rust
 *   **Audio**: `cpal` for input/output, `ringbuf` for lock free buffering
-*   **Network**: `webrtc-ice` for NAT traversal, `tokio` for async UDP
+*   **Network**: `webrtc-ice` for NAT traversal, `igd` for UPnP, `tokio` for async UDP
 *   **Interface**: `ratatui` text user interface
 
 ## License
