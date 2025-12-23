@@ -17,25 +17,25 @@ use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::sync::mpsc;
 
 const BUFFER_SIZE: usize = 19200;
-const STUN_SERVER: &str = "stun.l.google.com:19302";
 
 #[derive(Clone, Debug, PartialEq)]
 enum AppMode {
     Menu,
-    Hosting(u16),
     Connecting,
     IceGathering,
-    InCall(SocketAddr),
+    HostWaitingForAnswer { offer: String },
+    ClientGeneratingAnswer { answer: String },
+    IceConnecting,
+    InCall(String),
 }
 
 enum AppAction {
@@ -44,22 +44,25 @@ enum AppAction {
     Status(String),
     SetMode(AppMode),
     Input(event::KeyEvent),
-    SetIceData {
-        candidates: Vec<IceCandidate>,
-        offer: String,
-    },
+    SetOffer(String),
+    SetAnswer(String),
+    StoreHostAgent(IceAgentHandle),
+
+    StartConnection(Arc<dyn webrtc_util::Conn + Send + Sync>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct IceCandidate {
-    address: String,
-    port: u16,
-    candidate_type: String,
+struct SessionOffer {
+    ufrag: String,
+    pwd: String,
+    candidates: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct SessionDescription {
-    candidates: Vec<IceCandidate>,
+struct SessionAnswer {
+    ufrag: String,
+    pwd: String,
+    candidates: Vec<String>,
 }
 
 struct App {
@@ -70,8 +73,9 @@ struct App {
     input: String,
     should_quit: bool,
     local_ip: String,
-    ice_candidates: Vec<IceCandidate>,
     session_offer: Option<String>,
+    session_answer: Option<String>,
+    host_agent_handle: Option<IceAgentHandle>,
 }
 
 impl App {
@@ -87,8 +91,9 @@ impl App {
             input: String::new(),
             should_quit: false,
             local_ip,
-            ice_candidates: Vec::new(),
             session_offer: None,
+            session_answer: None,
+            host_agent_handle: None,
         }
     }
 
@@ -178,69 +183,200 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
     })
 }
 
-async fn gather_ice_candidates(
-    local_port: u16,
+use webrtc_ice::{
+    agent::{Agent, agent_config::AgentConfig},
+    network_type::NetworkType,
+    url::Url,
+};
+
+async fn create_ice_agent() -> Result<Agent> {
+    let stun_url = Url::parse_url("stun:stun.l.google.com:19302")?;
+
+    let config = AgentConfig {
+        network_types: vec![NetworkType::Udp4, NetworkType::Udp6],
+        urls: vec![stun_url],
+        ..Default::default()
+    };
+
+    Agent::new(config)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create ICE agent: {}", e))
+}
+
+struct IceAgentHandle {
+    agent: Arc<Agent>,
+    ufrag: String,
+    pwd: String,
+}
+
+async fn host_gather_candidates(action_tx: mpsc::Sender<AppAction>) -> Result<IceAgentHandle> {
+    let _ = action_tx
+        .send(AppAction::Log("Creating ICE agent...".into()))
+        .await;
+    let agent = create_ice_agent().await?;
+
+    let (gather_done_tx, mut gather_done_rx) = mpsc::channel::<()>(1);
+    let gather_tx_clone = gather_done_tx.clone();
+
+    agent.on_candidate(Box::new(move |candidate| {
+        let tx = gather_tx_clone.clone();
+        Box::pin(async move {
+            if candidate.is_none() {
+                let _ = tx.send(()).await;
+            }
+        })
+    }));
+
+    let _ = action_tx
+        .send(AppAction::Log("Gathering candidates...".into()))
+        .await;
+    agent.gather_candidates()?;
+
+    // Wait for gathering to complete
+    let _ = tokio::time::timeout(Duration::from_secs(5), gather_done_rx.recv()).await;
+
+    let (ufrag, pwd) = agent.get_local_user_credentials().await;
+    let candidates = agent.get_local_candidates().await?;
+
+    let _ = action_tx
+        .send(AppAction::Log(format!(
+            "Gathered {} candidates",
+            candidates.len()
+        )))
+        .await;
+
+    // Create offer
+    let offer = SessionOffer {
+        ufrag: ufrag.clone(),
+        pwd: pwd.clone(),
+        candidates: candidates.iter().map(|c| c.marshal()).collect(),
+    };
+
+    let offer_json = serde_json::to_string(&offer)?;
+    let offer_b64 = base64::encode(&offer_json);
+
+    let _ = action_tx.send(AppAction::SetOffer(offer_b64.clone())).await;
+    let _ = action_tx
+        .send(AppAction::SetMode(AppMode::HostWaitingForAnswer {
+            offer: offer_b64,
+        }))
+        .await;
+
+    Ok(IceAgentHandle {
+        agent: Arc::new(agent),
+        ufrag,
+        pwd,
+    })
+}
+
+async fn client_gather_candidates(
+    offer_b64: String,
     action_tx: mpsc::Sender<AppAction>,
-) -> Result<Vec<IceCandidate>> {
-    let mut candidates = Vec::new();
-    let local_ip = local_ip_address::local_ip()?.to_string();
+) -> Result<IceAgentHandle> {
+    let _ = action_tx
+        .send(AppAction::Log("Parsing offer...".into()))
+        .await;
 
-    candidates.push(IceCandidate {
-        address: local_ip.clone(),
-        port: local_port,
-        candidate_type: "host".to_string(),
-    });
+    let offer_json = base64::decode(&offer_b64).map_err(|_| anyhow::anyhow!("Invalid base64"))?;
+    let offer: SessionOffer = serde_json::from_slice(&offer_json)?;
 
-    if let Ok(public_addr) = discover_public_address(local_port).await {
-        candidates.push(IceCandidate {
-            address: public_addr.ip().to_string(),
-            port: public_addr.port(),
-            candidate_type: "srflx".to_string(),
-        });
-        let _ = action_tx
-            .send(AppAction::Log(format!("Found public IP: {}", public_addr)))
-            .await;
-    }
+    let _ = action_tx
+        .send(AppAction::Log("Creating ICE agent...".into()))
+        .await;
+    let agent = create_ice_agent().await?;
 
-    Ok(candidates)
-}
+    let _ = action_tx
+        .send(AppAction::Log("Setting remote credentials...".into()))
+        .await;
+    agent
+        .set_remote_credentials(offer.ufrag.clone(), offer.pwd.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to set remote credentials: {}", e))?;
 
-async fn discover_public_address(local_port: u16) -> Result<SocketAddr> {
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", local_port)).await?;
-    let transaction_id: [u8; 12] = rand::random();
-    let mut stun_request = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42];
-    stun_request.extend_from_slice(&transaction_id);
-
-    socket.send_to(&stun_request, STUN_SERVER).await?;
-    let mut buf = vec![0u8; 1024];
-    let (len, _) =
-        tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await??;
-
-    parse_stun_response(&buf[..len], &transaction_id).context("STUN parse error")
-}
-
-fn parse_stun_response(data: &[u8], expected_tid: &[u8; 12]) -> Option<SocketAddr> {
-    if data.len() < 20 || &data[8..20] != expected_tid {
-        return None;
-    }
-    let mut pos = 20;
-    while pos + 4 <= data.len() {
-        let attr_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
-        let attr_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-        if attr_type == 0x0020 && attr_len >= 8 {
-            let port = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) ^ 0x2112;
-            let ip = u32::from_be_bytes([
-                data[pos + 4] ^ 0x21,
-                data[pos + 5] ^ 0x12,
-                data[pos + 6] ^ 0xa4,
-                data[pos + 7] ^ 0x42,
-            ]);
-            return Some(SocketAddr::new(std::net::Ipv4Addr::from(ip).into(), port));
+    // Add remote candidates
+    for candidate_str in &offer.candidates {
+        match webrtc_ice::candidate::candidate_base::unmarshal_candidate(candidate_str) {
+            Ok(candidate) => {
+                let candidate_arc: Arc<dyn webrtc_ice::candidate::Candidate + Send + Sync> =
+                    Arc::from(candidate);
+                match agent.add_remote_candidate(&candidate_arc) {
+                    Ok(_) => {
+                        let _ = action_tx
+                            .send(AppAction::Log("Added remote candidate".into()))
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = action_tx
+                            .send(AppAction::Log(format!(
+                                "Failed to add candidate (continuing): {}",
+                                e
+                            )))
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = action_tx
+                    .send(AppAction::Log(format!("Failed to parse candidate: {}", e)))
+                    .await;
+            }
         }
-        pos = (pos + attr_len + 3) & !3;
     }
-    None
+
+    let _ = action_tx
+        .send(AppAction::Log("Gathering candidates...".into()))
+        .await;
+    let (gather_done_tx, mut gather_done_rx) = mpsc::channel::<()>(1);
+    let gather_tx_clone = gather_done_tx.clone();
+
+    agent.on_candidate(Box::new(move |candidate| {
+        let tx = gather_tx_clone.clone();
+        Box::pin(async move {
+            if candidate.is_none() {
+                let _ = tx.send(()).await;
+            }
+        })
+    }));
+
+    agent.gather_candidates()?;
+
+    // Wait for gathering to complete
+    let _ = tokio::time::timeout(Duration::from_secs(5), gather_done_rx.recv()).await;
+
+    let (ufrag, pwd) = agent.get_local_user_credentials().await;
+    let candidates = agent.get_local_candidates().await?;
+
+    let _ = action_tx
+        .send(AppAction::Log(format!(
+            "Gathered {} candidates",
+            candidates.len()
+        )))
+        .await;
+
+    // Create answer
+    let answer = SessionAnswer {
+        ufrag: ufrag.clone(),
+        pwd: pwd.clone(),
+        candidates: candidates.iter().map(|c| c.marshal()).collect(),
+    };
+
+    let answer_json = serde_json::to_string(&answer)?;
+    let answer_b64 = base64::encode(&answer_json);
+
+    let _ = action_tx
+        .send(AppAction::SetAnswer(answer_b64.clone()))
+        .await;
+    let _ = action_tx
+        .send(AppAction::SetMode(AppMode::ClientGeneratingAnswer {
+            answer: answer_b64,
+        }))
+        .await;
+
+    Ok(IceAgentHandle {
+        agent: Arc::new(agent),
+        ufrag: offer.ufrag,
+        pwd: offer.pwd,
+    })
 }
 
 async fn capture_processor(
@@ -276,55 +412,45 @@ async fn capture_processor(
     }
 }
 
-async fn try_connect_with_candidates(
-    socket: Arc<UdpSocket>,
-    remote_candidates: Vec<IceCandidate>,
-    action_tx: mpsc::Sender<AppAction>,
-) -> Option<SocketAddr> {
-    for candidate in &remote_candidates {
-        if let Ok(addr) = format!("{}:{}", candidate.address, candidate.port).parse::<SocketAddr>()
-        {
-            let _ = action_tx
-                .send(AppAction::Log(format!("ICE: Pinging {}", addr)))
-                .await;
-            for _ in 0..3 {
-                let _ = socket.send_to(b"PING", addr).await;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
-    None
-}
-
 async fn run_network(
-    socket: Arc<UdpSocket>,
-    mut peer: Option<SocketAddr>,
+    conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
     mut network_rx: mpsc::Receiver<Vec<u8>>,
     mut playback_prod: HeapProd<f32>,
     action_tx: mpsc::Sender<AppAction>,
-    is_active: Arc<AtomicBool>,
+    _is_active: Arc<AtomicBool>,
 ) {
     let mut buf = vec![0u8; 8192];
+
+    let _ = action_tx
+        .send(AppAction::Log("ICE Connected!".into()))
+        .await;
+
     loop {
         tokio::select! {
             Some(data) = network_rx.recv() => {
-                if let Some(addr) = peer { let _ = socket.send_to(&data, addr).await; }
+                if let Err(e) = conn.send(&data).await {
+                    let _ = action_tx.send(AppAction::Log(
+                        format!("Send error: {}", e)
+                    )).await;
+                }
             }
-            res = socket.recv_from(&mut buf) => {
-                if let Ok((len, addr)) = res {
-                    if len == 4 && (&buf[..4] == b"PING" || &buf[..4] == b"PONG") {
-                        if &buf[..4] == b"PING" { let _ = socket.send_to(b"PONG", addr).await; }
-                        if peer.is_none() {
-                            peer = Some(addr);
-                            let _ = action_tx.send(AppAction::Log(format!("ICE Connected: {}", addr))).await;
-                            let _ = action_tx.send(AppAction::SetMode(AppMode::InCall(addr))).await;
-                            is_active.store(true, Ordering::Relaxed);
+            res = conn.recv(&mut buf) => {
+                match res {
+                    Ok(len) => {
+                        if len > 4 {
+                            let samples = buf[4..len]
+                                .chunks_exact(2)
+                                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
+                            for s in samples {
+                                let _ = playback_prod.try_push(s);
+                            }
                         }
-                        continue;
                     }
-                    if Some(addr) == peer {
-                        let samples = buf[4..len].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
-                        for s in samples { let _ = playback_prod.try_push(s); }
+                    Err(e) => {
+                        let _ = action_tx.send(AppAction::Log(
+                            format!("Recv error: {}", e)
+                        )).await;
+                        break;
                     }
                 }
             }
@@ -345,10 +471,12 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
     let status = match &app.mode {
         AppMode::Menu => format!("IDLE | Your IP: {}", app.local_ip),
-        AppMode::Hosting(p) => format!("HOSTING | Port: {}", p),
         AppMode::IceGathering => "GATHERING ICE...".into(),
         AppMode::Connecting => "PASTE OFFER...".into(),
-        AppMode::InCall(addr) => format!("IN CALL: {}", addr),
+        AppMode::HostWaitingForAnswer { .. } => "WAITING FOR ANSWER (paste below)".into(),
+        AppMode::ClientGeneratingAnswer { .. } => "COPY ANSWER BELOW (send to host)".into(),
+        AppMode::IceConnecting => "CONNECTING...".into(),
+        AppMode::InCall(peer) => format!("IN CALL: {}", peer),
     };
 
     f.render_widget(
@@ -379,13 +507,19 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         chunks[1],
     );
 
-    let input_text = app.session_offer.as_ref().unwrap_or(&app.input);
-    f.render_widget(
-        Paragraph::new(input_text.as_str()).block(
-            Block::default()
-                .title("ICE Session Data")
-                .borders(Borders::ALL),
+    let (display_text, title) = match &app.mode {
+        AppMode::HostWaitingForAnswer { offer } => (
+            offer.as_str(),
+            "Your Offer (send to client) | Paste Answer Below:",
         ),
+        AppMode::ClientGeneratingAnswer { answer } => {
+            (answer.as_str(), "Your Answer (send to host)")
+        }
+        _ => (app.input.as_str(), "Input / Session Data"),
+    };
+
+    f.render_widget(
+        Paragraph::new(display_text).block(Block::default().title(title).borders(Borders::ALL)),
         chunks[2],
     );
 
@@ -408,13 +542,18 @@ async fn main() -> Result<()> {
     std::thread::spawn(move || {
         loop {
             if let Ok(true) = event::poll(Duration::from_millis(50))
-                && let Ok(Event::Key(key)) = event::read() {
-                    let _ = input_tx.blocking_send(AppAction::Input(key));
-                }
+                && let Ok(Event::Key(key)) = event::read()
+            {
+                let _ = input_tx.blocking_send(AppAction::Input(key));
+            }
         }
     });
 
-    let (mut net_task, mut cap_task, mut audio_handle) = (None, None, None);
+    let (mut net_task, mut cap_task, mut audio_handle): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<AudioHandle>,
+    ) = (None, None, None);
 
     loop {
         terminal.draw(|f| render_ui(f, &app))?;
@@ -423,9 +562,45 @@ async fn main() -> Result<()> {
             match action {
                 AppAction::Log(m) => app.add_log(m),
                 AppAction::SetMode(m) => app.mode = m,
-                AppAction::SetIceData { candidates, offer } => {
-                    app.ice_candidates = candidates;
+                AppAction::SetOffer(offer) => {
                     app.session_offer = Some(offer);
+                }
+                AppAction::SetAnswer(answer) => {
+                    app.session_answer = Some(answer);
+                }
+                AppAction::StoreHostAgent(handle) => {
+                    app.host_agent_handle = Some(handle);
+                }
+
+                AppAction::StartConnection(conn) => {
+                    // Setup audio and network
+                    let (ntx, nrx) = mpsc::channel(100);
+                    let (cap_prod, cap_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
+                    let (play_prod, play_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
+
+                    if let Ok(audio) = setup_audio(cap_prod, play_cons) {
+                        audio.start();
+
+                        // Store the handles!
+                        cap_task = Some(tokio::spawn(capture_processor(
+                            cap_cons,
+                            ntx,
+                            audio.is_active.clone(),
+                            audio.sample_rate,
+                        )));
+
+                        net_task = Some(tokio::spawn(run_network(
+                            conn,
+                            nrx,
+                            play_prod,
+                            action_tx.clone(),
+                            audio.is_active.clone(),
+                        )));
+
+                        audio_handle = Some(audio);
+
+                        app.mode = AppMode::InCall("Connected".into());
+                    }
                 }
                 AppAction::Input(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -433,90 +608,190 @@ async fn main() -> Result<()> {
                     }
                     match (&app.mode, key.code) {
                         (_, KeyCode::Char('q')) => app.should_quit = true,
+
+                        // Host flow: Press 'h' to start hosting
                         (AppMode::Menu, KeyCode::Char('h')) => {
                             app.mode = AppMode::IceGathering;
                             let tx = action_tx.clone();
                             tokio::spawn(async move {
-                                if let Ok(candidates) =
-                                    gather_ice_candidates(9090, tx.clone()).await
-                                {
-                                    let offer = base64::encode(
-                                        &serde_json::to_string(&SessionDescription {
-                                            candidates: candidates.clone(),
-                                        })
-                                        .unwrap(),
-                                    );
-                                    let _ =
-                                        tx.send(AppAction::SetIceData { candidates, offer }).await;
-                                    let _ =
-                                        tx.send(AppAction::SetMode(AppMode::Hosting(9090))).await;
+                                match host_gather_candidates(tx.clone()).await {
+                                    Ok(handle) => {
+                                        // Store the agent handle for later use
+                                        let _ = tx.send(AppAction::StoreHostAgent(handle)).await;
+                                        let _ = tx
+                                            .send(AppAction::Log(
+                                                "Offer generated! Waiting for answer...".into(),
+                                            ))
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ =
+                                            tx.send(AppAction::Log(format!("Error: {}", e))).await;
+                                        let _ = tx.send(AppAction::SetMode(AppMode::Menu)).await;
+                                    }
                                 }
                             });
-                            let socket = Arc::new(UdpSocket::bind("0.0.0.0:9090").await?);
-                            let (ntx, nrx) = mpsc::channel(100);
-                            let (cap_prod, cap_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
-                            let (play_prod, play_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
-                            if let Ok(audio) = setup_audio(cap_prod, play_cons) {
-                                cap_task = Some(tokio::spawn(capture_processor(
-                                    cap_cons,
-                                    ntx,
-                                    audio.is_active.clone(),
-                                    audio.sample_rate,
-                                )));
-                                net_task = Some(tokio::spawn(run_network(
-                                    socket,
-                                    None,
-                                    nrx,
-                                    play_prod,
-                                    action_tx.clone(),
-                                    audio.is_active.clone(),
-                                )));
-                                audio_handle = Some(audio);
+                        }
+
+                        // Host receives answer and completes connection
+                        (AppMode::HostWaitingForAnswer { .. }, KeyCode::Enter) => {
+                            if !app.input.is_empty() && app.host_agent_handle.is_some() {
+                                let answer_b64 = app.input.clone();
+                                let agent_handle = app.host_agent_handle.take().unwrap();
+                                let tx = action_tx.clone();
+
+                                app.mode = AppMode::IceConnecting;
+                                app.input.clear();
+
+                                tokio::spawn(async move {
+                                    // Parse answer
+                                    if let Ok(answer_json) = base64::decode(&answer_b64)
+                                        && let Ok(answer) =
+                                            serde_json::from_slice::<SessionAnswer>(&answer_json)
+                                    {
+                                        let _ = tx
+                                            .send(AppAction::Log("Calling accept()...".into()))
+                                            .await;
+
+                                        // Add remote candidates from answer
+                                        for candidate_str in &answer.candidates {
+                                            match webrtc_ice::candidate::candidate_base::unmarshal_candidate(candidate_str) {
+                                                    Ok(candidate) => {
+                                                        let candidate_arc: Arc<dyn webrtc_ice::candidate::Candidate + Send + Sync> = Arc::from(candidate);
+                                                        match agent_handle.agent.add_remote_candidate(&candidate_arc) {
+                                                            Ok(_) => {
+                                                                let _ = tx.send(AppAction::Log("Added remote candidate".into())).await;
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = tx.send(AppAction::Log(
+                                                                    format!("Failed to add candidate (continuing): {}", e)
+                                                                )).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx.send(AppAction::Log(
+                                                            format!("Failed to parse candidate: {}", e)
+                                                        )).await;
+                                                    }
+                                                }
+                                        }
+
+                                        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+                                        match agent_handle
+                                            .agent
+                                            .accept(cancel_rx, answer.ufrag, answer.pwd)
+                                            .await
+                                        {
+                                            Ok(conn) => {
+                                                let _ = tx
+                                                    .send(AppAction::Log(
+                                                        "ICE connection established!".into(),
+                                                    ))
+                                                    .await;
+                                                let _ =
+                                                    tx.send(AppAction::StartConnection(conn)).await;
+                                            }
+                                            Err(e) => {
+                                                let _ = tx
+                                                    .send(AppAction::Log(format!(
+                                                        "Accept error: {}",
+                                                        e
+                                                    )))
+                                                    .await;
+                                                let _ = tx
+                                                    .send(AppAction::SetMode(AppMode::Menu))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
+
+                        // Client flow: Press 'c' to connect
                         (AppMode::Menu, KeyCode::Char('c')) => {
                             app.mode = AppMode::Connecting;
                             app.input.clear();
                         }
+
+                        // Client pastes offer and generates answer
                         (AppMode::Connecting, KeyCode::Enter) => {
-                            if let Ok(decoded) = base64::decode(&app.input)
-                                && let Ok(session) =
-                                    serde_json::from_slice::<SessionDescription>(&decoded)
-                                {
-                                    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-                                    let (ntx, nrx) = mpsc::channel(100);
-                                    let (cap_p, cap_c) = HeapRb::<f32>::new(BUFFER_SIZE).split();
-                                    let (play_p, play_c) = HeapRb::<f32>::new(BUFFER_SIZE).split();
-                                    if let Ok(audio) = setup_audio(cap_p, play_c) {
-                                        audio.start();
-                                        tokio::spawn(try_connect_with_candidates(
-                                            socket.clone(),
-                                            session.candidates,
-                                            action_tx.clone(),
-                                        ));
-                                        cap_task = Some(tokio::spawn(capture_processor(
-                                            cap_c,
-                                            ntx,
-                                            audio.is_active.clone(),
-                                            audio.sample_rate,
-                                        )));
-                                        net_task = Some(tokio::spawn(run_network(
-                                            socket,
-                                            None,
-                                            nrx,
-                                            play_p,
-                                            action_tx.clone(),
-                                            audio.is_active.clone(),
-                                        )));
-                                        audio_handle = Some(audio);
-                                        app.mode = AppMode::IceGathering;
+                            if !app.input.is_empty() {
+                                let offer_b64 = app.input.clone();
+                                let tx = action_tx.clone();
+
+                                app.mode = AppMode::IceGathering;
+                                app.input.clear();
+
+                                tokio::spawn(async move {
+                                    match client_gather_candidates(offer_b64, tx.clone()).await {
+                                        Ok(agent_handle) => {
+                                            // Now we need to dial
+                                            let _ =
+                                                tx.send(AppAction::Log("Dialing...".into())).await;
+                                            let _ = tx
+                                                .send(AppAction::SetMode(AppMode::IceConnecting))
+                                                .await;
+
+                                            let (_cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+                                            match agent_handle
+                                                .agent
+                                                .dial(
+                                                    cancel_rx,
+                                                    agent_handle.ufrag,
+                                                    agent_handle.pwd,
+                                                )
+                                                .await
+                                            {
+                                                Ok(conn) => {
+                                                    let _ = tx
+                                                        .send(AppAction::Log(
+                                                            "ICE connection established!".into(),
+                                                        ))
+                                                        .await;
+                                                    let _ = tx
+                                                        .send(AppAction::StartConnection(conn))
+                                                        .await;
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx
+                                                        .send(AppAction::Log(format!(
+                                                            "Dial error: {}",
+                                                            e
+                                                        )))
+                                                        .await;
+                                                    let _ = tx
+                                                        .send(AppAction::SetMode(AppMode::Menu))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = tx
+                                                .send(AppAction::Log(format!("Error: {}", e)))
+                                                .await;
+                                            let _ =
+                                                tx.send(AppAction::SetMode(AppMode::Menu)).await;
+                                        }
                                     }
-                                }
+                                });
+                            }
                         }
+
+                        // Input handling for connecting/waiting states
                         (AppMode::Connecting, KeyCode::Char(c)) => app.input.push(c),
                         (AppMode::Connecting, KeyCode::Backspace) => {
                             app.input.pop();
                         }
+                        (AppMode::HostWaitingForAnswer { .. }, KeyCode::Char(c)) => {
+                            app.input.push(c)
+                        }
+                        (AppMode::HostWaitingForAnswer { .. }, KeyCode::Backspace) => {
+                            app.input.pop();
+                        }
+
+                        // ESC to cancel/end
                         (_, KeyCode::Esc) => {
                             if let Some(t) = net_task.take() {
                                 t.abort();
@@ -527,8 +802,12 @@ async fn main() -> Result<()> {
                             if let Some(a) = audio_handle.take() {
                                 a.stop();
                             }
+                            app.host_agent_handle = None;
+
                             app.mode = AppMode::Menu;
                             app.session_offer = None;
+                            app.session_answer = None;
+                            app.input.clear();
                         }
                         _ => {}
                     }
