@@ -26,6 +26,7 @@ cargo run
 
 *   **H**: Host a session. Generates a session offer to share.
 *   **C**: Connect to a session. Takes a session offer and generates an answer.
+*   **M**: Mute/unmute microphone (during call only).
 *   **Enter**: Confirm input.
 *   **Esc**: End call or return to menu.
 *   **Q**: Quit.
@@ -36,6 +37,7 @@ cargo run
 2.  **Client**: Press **C**. Paste the Session Offer. Copy the generated Session Answer string and send it back to the host.
 3.  **Host**: Paste the Session Answer.
 4.  Connection establishes automatically.
+5.  **During Call**: Press **M** to toggle microphone mute. The status bar and volume gauge will reflect the mute state.
 
 ## Architecture
 

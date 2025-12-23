@@ -62,6 +62,7 @@ enum AppAction {
 
     StartConnection(Arc<dyn webrtc_util::Conn + Send + Sync>),
     SetMicVolume(f32),
+    ToggleMute,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -90,6 +91,7 @@ struct App {
     session_answer: Option<String>,
     host_agent_handle: Option<IceAgentHandle>,
     mic_volume: f32,
+    is_muted: bool,
 }
 
 impl App {
@@ -109,6 +111,7 @@ impl App {
             session_answer: None,
             host_agent_handle: None,
             mic_volume: 0.0,
+            is_muted: false,
         }
     }
 
@@ -123,6 +126,7 @@ impl App {
 struct AudioHandle {
     _streams: (cpal::Stream, cpal::Stream),
     is_active: Arc<AtomicBool>,
+    is_muted: Arc<AtomicBool>,
     sample_rate: u32,
 }
 
@@ -132,6 +136,11 @@ impl AudioHandle {
     }
     fn stop(&self) {
         self.is_active.store(false, Ordering::Relaxed);
+    }
+    fn toggle_mute(&self) -> bool {
+        let current = self.is_muted.load(Ordering::Relaxed);
+        self.is_muted.store(!current, Ordering::Relaxed);
+        !current
     }
 }
 
@@ -152,6 +161,7 @@ impl CallSession {
 fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Result<AudioHandle> {
     let host = cpal::default_host();
     let is_active = Arc::new(AtomicBool::new(false));
+    let is_muted = Arc::new(AtomicBool::new(false));
 
     let input_dev = host.default_input_device().context("No input device")?;
     let output_dev = host.default_output_device().context("No output device")?;
@@ -179,6 +189,7 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
     let out_channels = out_cfg.channels() as usize;
 
     let active_in = is_active.clone();
+    let muted_in = is_muted.clone();
     let mut capture_prod_f32 = capture_prod;
     let input_stream = match in_cfg.sample_format() {
         cpal::SampleFormat::F32 => input_dev.build_input_stream(
@@ -187,8 +198,13 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
                 if !active_in.load(Ordering::Relaxed) {
                     return;
                 }
+                let is_muted = muted_in.load(Ordering::Relaxed);
                 for frame in data.chunks_exact(in_channels) {
-                    let mono: f32 = frame.iter().sum::<f32>() / in_channels as f32;
+                    let mono: f32 = if is_muted {
+                        0.0
+                    } else {
+                        frame.iter().sum::<f32>() / in_channels as f32
+                    };
                     let _ = capture_prod_f32.try_push(mono);
                 }
             },
@@ -222,6 +238,7 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
     Ok(AudioHandle {
         _streams: (input_stream, output_stream),
         is_active,
+        is_muted,
         sample_rate,
     })
 }
@@ -726,7 +743,10 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         AppMode::HostWaitingForAnswer { .. } => "WAITING FOR ANSWER (paste below)".into(),
         AppMode::ClientGeneratingAnswer { .. } => "COPY ANSWER BELOW (send to host)".into(),
         AppMode::IceConnecting => "CONNECTING...".into(),
-        AppMode::InCall(peer) => format!("IN CALL: {}", peer),
+        AppMode::InCall(peer) => {
+            let mute_status = if app.is_muted { " | MUTED" } else { "" };
+            format!("IN CALL: {}{}", peer, mute_status)
+        }
     };
 
     f.render_widget(
@@ -745,9 +765,21 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
     );
 
     if let AppMode::InCall(_) = app.mode {
+        let gauge_color = if app.is_muted {
+            Color::Red
+        } else {
+            Color::Green
+        };
+
+        let gauge_title = if app.is_muted {
+            "Mic Volume (MUTED)"
+        } else {
+            "Mic Volume"
+        };
+
         let gauge = Gauge::default()
-            .block(Block::default().title("Mic Volume").borders(Borders::ALL))
-            .gauge_style(Style::default().fg(Color::Green))
+            .block(Block::default().title(gauge_title).borders(Borders::ALL))
+            .gauge_style(Style::default().fg(gauge_color))
             .ratio(app.mic_volume.clamp(0.0, 1.0) as f64);
 
         let inner_chunks = Layout::default()
@@ -799,7 +831,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         chunks[2],
     );
 
-    let help = " [H] Host | [C] Connect | [ESC] End | [Q] Quit ";
+    let help = " [H] Host | [C] Connect | [M] Mute | [ESC] End | [Q] Quit ";
     f.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         chunks[3],
@@ -846,6 +878,18 @@ async fn main() -> Result<()> {
                 AppAction::SetMicVolume(vol) => {
                     app.mic_volume = vol;
                 }
+                AppAction::ToggleMute => {
+                    if let Some(ref s) = session {
+                        let is_muted = s.audio.toggle_mute();
+                        app.is_muted = is_muted;
+                        let msg = if is_muted {
+                            "Microphone muted"
+                        } else {
+                            "Microphone unmuted"
+                        };
+                        app.add_log(msg.into());
+                    }
+                }
 
                 AppAction::StartConnection(conn) => {
                     // Setup audio and network
@@ -880,6 +924,7 @@ async fn main() -> Result<()> {
                         });
 
                         app.mode = AppMode::InCall("Connected".into());
+                        app.is_muted = false;
                     }
                 }
                 AppAction::Input(key) => {
@@ -888,6 +933,11 @@ async fn main() -> Result<()> {
                     }
                     match (&app.mode, key.code) {
                         (_, KeyCode::Char('q')) => app.should_quit = true,
+
+                        // Mute toggle (only during call)
+                        (AppMode::InCall(_), KeyCode::Char('m')) => {
+                            let _ = action_tx.send(AppAction::ToggleMute).await;
+                        }
 
                         // Host flow: Press 'h' to start hosting
                         (AppMode::Menu, KeyCode::Char('h')) => {
@@ -1119,6 +1169,7 @@ async fn main() -> Result<()> {
                             app.session_offer = None;
                             app.session_answer = None;
                             app.input.clear();
+                            app.is_muted = false;
                         }
                         _ => {}
                     }
