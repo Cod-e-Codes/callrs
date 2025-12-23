@@ -40,8 +40,8 @@ cargo run
 ## Architecture
 
 *   **Language**: Rust
-*   **Audio**: `cpal` for input/output, `ringbuf` for lock free buffering (with drift compensation)
-*   **Network**: `webrtc-ice` for NAT traversal (STUN only), `tokio` for async UDP
+*   **Audio**: `cpal` for input/output, `ringbuf` for lock free buffering
+*   **Network**: `webrtc-ice` for NAT traversal, `tokio` for async UDP
 *   **Interface**: `ratatui` text user interface
 
 ## License
