@@ -130,6 +130,7 @@ name = "callrs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytemuck",
  "cpal",
  "crossterm 0.29.0",

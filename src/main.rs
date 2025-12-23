@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -253,7 +254,7 @@ async fn host_gather_candidates(action_tx: mpsc::Sender<AppAction>) -> Result<Ic
     };
 
     let offer_json = serde_json::to_string(&offer)?;
-    let offer_b64 = base64::encode(&offer_json);
+    let offer_b64 = BASE64_STANDARD.encode(&offer_json);
 
     let _ = action_tx.send(AppAction::SetOffer(offer_b64.clone())).await;
     let _ = action_tx
@@ -277,7 +278,9 @@ async fn client_gather_candidates(
         .send(AppAction::Log("Parsing offer...".into()))
         .await;
 
-    let offer_json = base64::decode(&offer_b64).map_err(|_| anyhow::anyhow!("Invalid base64"))?;
+    let offer_json = BASE64_STANDARD
+        .decode(&offer_b64)
+        .map_err(|_| anyhow::anyhow!("Invalid base64"))?;
     let offer: SessionOffer = serde_json::from_slice(&offer_json)?;
 
     let _ = action_tx
@@ -361,7 +364,7 @@ async fn client_gather_candidates(
     };
 
     let answer_json = serde_json::to_string(&answer)?;
-    let answer_b64 = base64::encode(&answer_json);
+    let answer_b64 = BASE64_STANDARD.encode(&answer_json);
 
     let _ = action_tx
         .send(AppAction::SetAnswer(answer_b64.clone()))
@@ -441,6 +444,11 @@ async fn run_network(
                             let samples = buf[4..len]
                                 .chunks_exact(2)
                                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
+                            // Basic buffer overflow protection (clock drift compensation)
+                            if playback_prod.occupied_len() > 9600 {
+                                continue;
+                            }
+
                             for s in samples {
                                 let _ = playback_prod.try_push(s);
                             }
@@ -645,7 +653,7 @@ async fn main() -> Result<()> {
 
                                 tokio::spawn(async move {
                                     // Parse answer
-                                    if let Ok(answer_json) = base64::decode(&answer_b64)
+                                    if let Ok(answer_json) = BASE64_STANDARD.decode(&answer_b64)
                                         && let Ok(answer) =
                                             serde_json::from_slice::<SessionAnswer>(&answer_json)
                                     {
@@ -847,64 +855,4 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
-}
-
-mod base64 {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    pub fn encode(data: &str) -> String {
-        let mut res = String::new();
-        for chunk in data.as_bytes().chunks(3) {
-            let b = [
-                chunk[0],
-                *chunk.get(1).unwrap_or(&0),
-                *chunk.get(2).unwrap_or(&0),
-            ];
-            res.push(CHARSET[(b[0] >> 2) as usize] as char);
-            res.push(CHARSET[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
-            res.push(if chunk.len() > 1 {
-                CHARSET[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char
-            } else {
-                '='
-            });
-            res.push(if chunk.len() > 2 {
-                CHARSET[(b[2] & 0x3f) as usize] as char
-            } else {
-                '='
-            });
-        }
-        res
-    }
-
-    // FIXED: Corrected type mismatch and Option handling
-    pub fn decode(data: &str) -> Result<Vec<u8>, ()> {
-        let mut res = Vec::new();
-        let bytes: Vec<u8> = data.bytes().filter(|&b| b != b'=').collect();
-        for chunk in bytes.chunks(4) {
-            if chunk.len() < 2 {
-                return Err(());
-            }
-            let c1 = d(chunk[0])?;
-            let c2 = d(chunk[1])?;
-            res.push((c1 << 2) | (c2 >> 4));
-            if let Some(&b3) = chunk.get(2) {
-                let c3 = d(b3)?;
-                res.push((c2 << 4) | (c3 >> 2));
-                if let Some(&b4) = chunk.get(3) {
-                    let c4 = d(b4)?;
-                    res.push((c3 << 6) | c4);
-                }
-            }
-        }
-        Ok(res)
-    }
-    fn d(c: u8) -> Result<u8, ()> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(()),
-        }
-    }
 }
