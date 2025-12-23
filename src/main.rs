@@ -421,8 +421,10 @@ async fn run_network(
     mut playback_prod: HeapProd<f32>,
     action_tx: mpsc::Sender<AppAction>,
     _is_active: Arc<AtomicBool>,
+    sample_rate: u32,
 ) {
     let mut buf = vec![0u8; 8192];
+    let mut buffering = true;
 
     let _ = action_tx
         .send(AppAction::Log("ICE Connected!".into()))
@@ -444,6 +446,17 @@ async fn run_network(
                             let samples = buf[4..len]
                                 .chunks_exact(2)
                                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
+
+                            // Initialize jitter buffer logic (60ms pre-fill)
+                            if buffering {
+                                let jitter_samples = (sample_rate as f32 * 0.060) as usize;
+                                for _ in 0..jitter_samples {
+                                    let _ = playback_prod.try_push(0.0);
+                                }
+                                buffering = false;
+                                let _ = action_tx.send(AppAction::Log("Jitter buffer primed (60ms)".into())).await;
+                            }
+
                             // Basic buffer overflow protection (clock drift compensation)
                             if playback_prod.occupied_len() > 9600 {
                                 continue;
@@ -603,6 +616,7 @@ async fn main() -> Result<()> {
                             play_prod,
                             action_tx.clone(),
                             audio.is_active.clone(),
+                            audio.sample_rate,
                         )));
 
                         audio_handle = Some(audio);
