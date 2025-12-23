@@ -26,6 +26,15 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+use audiopus::{
+    Application as OpusApplication, Channels as OpusChannels, SampleRate as OpusSampleRate,
+    coder::{Decoder as OpusDecoder, Encoder as OpusEncoder},
+};
+
+const SAMPLE_RATE: u32 = 48000; // API requires 48k for best Opus compatibility
+const FRAME_DURATION_MS: u32 = 20;
+const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize; // 960 samples
+
 const BUFFER_SIZE: usize = 19200;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,10 +140,24 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
     let input_dev = host.default_input_device().context("No input device")?;
     let output_dev = host.default_output_device().context("No output device")?;
 
-    let in_cfg = input_dev.default_input_config()?;
-    let out_cfg = output_dev.default_output_config()?;
+    // Try to find a 48kHz config
+    let in_cfg = input_dev
+        .supported_input_configs()?
+        .find(|c| c.min_sample_rate() <= SAMPLE_RATE && c.max_sample_rate() >= SAMPLE_RATE)
+        .map(|c| c.with_sample_rate(SAMPLE_RATE))
+        .unwrap_or_else(|| input_dev.default_input_config().unwrap());
 
+    let out_cfg = output_dev
+        .supported_output_configs()?
+        .find(|c| c.min_sample_rate() <= SAMPLE_RATE && c.max_sample_rate() >= SAMPLE_RATE)
+        .map(|c| c.with_sample_rate(SAMPLE_RATE))
+        .unwrap_or_else(|| output_dev.default_output_config().unwrap());
+
+    // Fallback if we couldn't get 48kHz
     let sample_rate: u32 = in_cfg.sample_rate();
+    if sample_rate != SAMPLE_RATE {
+        // In a production app we'd resample.
+    }
 
     let in_channels = in_cfg.channels() as usize;
     let out_channels = out_cfg.channels() as usize;
@@ -425,11 +448,21 @@ async fn capture_processor(
     mut capture_cons: HeapCons<f32>,
     network_tx: mpsc::Sender<Vec<u8>>,
     is_active: Arc<AtomicBool>,
-    sample_rate: u32,
+    _sample_rate: u32,
     action_tx: mpsc::Sender<AppAction>,
 ) {
-    let frame_size = ((sample_rate as f32) * 0.02) as usize;
-    let mut frame_buf = Vec::with_capacity(frame_size);
+    // Opus Encoder setup
+    let encoder = OpusEncoder::new(
+        OpusSampleRate::Hz48000,
+        OpusChannels::Mono,
+        OpusApplication::Voip,
+    )
+    .expect("Failed to create Opus encoder");
+
+    let frame_size = FRAME_SIZE;
+    let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_size);
+    let mut opus_buf = vec![0u8; 1024];
+
     let mut sequence: u32 = 0;
 
     // For volume calculation
@@ -442,36 +475,43 @@ async fn capture_processor(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
-        while let Some(sample) = capture_cons.try_pop() {
-            // Volume Metric (RMS-ish)
-            vol_sum += sample.abs();
-            vol_count += 1;
 
-            // Send volume update ~20Hz
-            if vol_count >= sample_rate as usize / 20 {
-                let avg = vol_sum / vol_count as f32;
-                // Boost a bit for visibility
-                let vol_normalized = (avg * 5.0).clamp(0.0, 1.0);
-                if last_vol_update.elapsed().as_millis() > 50 {
-                    let _ = action_tx.try_send(AppAction::SetMicVolume(vol_normalized));
-                    last_vol_update = std::time::Instant::now();
+        while capture_cons.occupied_len() >= frame_size {
+            for _ in 0..frame_size {
+                let sample = capture_cons.try_pop().unwrap_or(0.0);
+
+                vol_sum += sample.abs();
+                vol_count += 1;
+
+                if vol_count >= frame_size {
+                    let avg = vol_sum / vol_count as f32;
+                    let vol_normalized = (avg * 5.0).clamp(0.0, 1.0);
+                    if last_vol_update.elapsed().as_millis() > 50 {
+                        let _ = action_tx.try_send(AppAction::SetMicVolume(vol_normalized));
+                        last_vol_update = std::time::Instant::now();
+                    }
+                    vol_sum = 0.0;
+                    vol_count = 0;
                 }
-                vol_sum = 0.0;
-                vol_count = 0;
+
+                let s_i16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                pcm_buf.push(s_i16);
             }
 
-            let s_i16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            frame_buf.push(s_i16);
-            if frame_buf.len() >= frame_size {
-                let mut packet = Vec::with_capacity(4 + frame_size * 2);
-                packet.extend_from_slice(&sequence.to_le_bytes());
-                for &s in &frame_buf {
-                    packet.extend_from_slice(&s.to_le_bytes());
+            match encoder.encode(&pcm_buf, &mut opus_buf) {
+                Ok(len) => {
+                    let mut packet = Vec::with_capacity(4 + len);
+                    packet.extend_from_slice(&sequence.to_le_bytes());
+                    packet.extend_from_slice(&opus_buf[..len]);
+                    let _ = network_tx.try_send(packet);
+                    sequence = sequence.wrapping_add(1);
                 }
-                let _ = network_tx.try_send(packet);
-                frame_buf.clear();
-                sequence = sequence.wrapping_add(1);
+                Err(e) => {
+                    let _ =
+                        action_tx.try_send(AppAction::Log(format!("Opus encode error: {:?}", e)));
+                }
             }
+            pcm_buf.clear();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -483,10 +523,16 @@ async fn run_network(
     mut playback_prod: HeapProd<f32>,
     action_tx: mpsc::Sender<AppAction>,
     _is_active: Arc<AtomicBool>,
-    sample_rate: u32,
+    _sample_rate: u32,
 ) {
     let mut buf = vec![0u8; 8192];
     let mut buffering = true;
+
+    // Opus Decoder
+    let mut decoder = OpusDecoder::new(OpusSampleRate::Hz48000, OpusChannels::Mono)
+        .expect("Failed to create Opus decoder");
+
+    let mut decoded_pcm = vec![0i16; FRAME_SIZE];
 
     let _ = action_tx
         .send(AppAction::Log("ICE Connected!".into()))
@@ -505,27 +551,34 @@ async fn run_network(
                 match res {
                     Ok(len) => {
                         if len > 4 {
-                            let samples = buf[4..len]
-                                .chunks_exact(2)
-                                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0);
+                            // Opus payload (skip 4 byte sequence)
+                            let opus_payload = &buf[4..len];
 
-                            // Initialize jitter buffer logic (60ms pre-fill)
-                            if buffering {
-                                let jitter_samples = (sample_rate as f32 * 0.060) as usize;
-                                for _ in 0..jitter_samples {
-                                    let _ = playback_prod.try_push(0.0);
+                            match decoder.decode(Some(opus_payload), &mut decoded_pcm, false) {
+                                Ok(samples_len) => {
+                                    // Initialize jitter buffer logic (60ms pre-fill)
+                                    if buffering {
+                                        let jitter_samples = FRAME_SIZE * 3;
+                                        for _ in 0..jitter_samples {
+                                            let _ = playback_prod.try_push(0.0);
+                                        }
+                                        buffering = false;
+                                        let _ = action_tx.send(AppAction::Log("Jitter buffer primed (60ms)".into())).await;
+                                    }
+
+                                    // Basic buffer overflow protection
+                                    if playback_prod.occupied_len() > 9600 {
+                                        continue;
+                                    }
+
+                                    for &s in &decoded_pcm[..samples_len] {
+                                        let s_f32 = s as f32 / 32768.0;
+                                        let _ = playback_prod.try_push(s_f32);
+                                    }
                                 }
-                                buffering = false;
-                                let _ = action_tx.send(AppAction::Log("Jitter buffer primed (60ms)".into())).await;
-                            }
-
-                            // Basic buffer overflow protection (clock drift compensation)
-                            if playback_prod.occupied_len() > 9600 {
-                                continue;
-                            }
-
-                            for s in samples {
-                                let _ = playback_prod.try_push(s);
+                                Err(e) => {
+                                     let _ = action_tx.send(AppAction::Log(format!("Opus decode error: {:?}", e))).await;
+                                }
                             }
                         }
                     }
