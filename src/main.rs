@@ -689,6 +689,18 @@ async fn main() -> Result<()> {
                                                         "ICE connection established!".into(),
                                                     ))
                                                     .await;
+
+                                                if let Some(pair) =
+                                                    agent_handle.agent.get_selected_candidate_pair()
+                                                {
+                                                    let _ = tx
+                                                        .send(AppAction::Log(format!(
+                                                            "Connected via: {}",
+                                                            pair
+                                                        )))
+                                                        .await;
+                                                }
+
                                                 let _ =
                                                     tx.send(AppAction::StartConnection(conn)).await;
                                             }
@@ -750,6 +762,19 @@ async fn main() -> Result<()> {
                                                             "ICE connection established!".into(),
                                                         ))
                                                         .await;
+
+                                                    if let Some(pair) = agent_handle
+                                                        .agent
+                                                        .get_selected_candidate_pair()
+                                                    {
+                                                        let _ = tx
+                                                            .send(AppAction::Log(format!(
+                                                                "Connected via: {}",
+                                                                pair
+                                                            )))
+                                                            .await;
+                                                    }
+
                                                     let _ = tx
                                                         .send(AppAction::StartConnection(conn))
                                                         .await;
