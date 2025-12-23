@@ -184,6 +184,32 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
     })
 }
 
+// Helper: Try to open UPnP port
+fn try_upnp_mapping(local_port: u16) -> Result<String> {
+    use igd::search_gateway;
+    use std::net::SocketAddrV4;
+
+    let gateway = search_gateway(Default::default())
+        .map_err(|e| anyhow::anyhow!("UPnP Gateway not found: {}", e))?;
+
+    let local_ip = local_ip_address::local_ip()?;
+    let local_addr = match local_ip {
+        std::net::IpAddr::V4(v4) => SocketAddrV4::new(v4, local_port),
+        _ => return Err(anyhow::anyhow!("IPv6 not supported for simple UPnP")),
+    };
+
+    match gateway.add_port(
+        igd::PortMappingProtocol::UDP,
+        local_port, // external port (same as internal for simplicity)
+        local_addr,
+        3600, // 1 hour lease
+        "CallRS Voice App",
+    ) {
+        Ok(_) => Ok(format!("UPnP Success! Port {} mapped.", local_port)),
+        Err(e) => Err(anyhow::anyhow!("UPnP Mapping Failed: {}", e)),
+    }
+}
+
 use webrtc_ice::{
     agent::{Agent, agent_config::AgentConfig},
     network_type::NetworkType,
@@ -636,6 +662,13 @@ async fn main() -> Result<()> {
                             app.mode = AppMode::IceGathering;
                             let tx = action_tx.clone();
                             tokio::spawn(async move {
+                                // Try UPnP (best effort) to map port 9090
+                                if let Ok(msg) = try_upnp_mapping(9090) {
+                                    let _ = tx.send(AppAction::Log(msg)).await;
+                                } else {
+                                    let _ = tx.send(AppAction::Log("UPnP: Router did not respond (falling back to STUN/Relay)".into())).await;
+                                }
+
                                 match host_gather_candidates(tx.clone()).await {
                                     Ok(handle) => {
                                         // Store the agent handle for later use
@@ -759,6 +792,11 @@ async fn main() -> Result<()> {
                                 app.input.clear();
 
                                 tokio::spawn(async move {
+                                    // Try UPnP for client too
+                                    if let Ok(msg) = try_upnp_mapping(9090) {
+                                        let _ = tx.send(AppAction::Log(msg)).await;
+                                    }
+
                                     match client_gather_candidates(offer_b64, tx.clone()).await {
                                         Ok(agent_handle) => {
                                             // Now we need to dial
