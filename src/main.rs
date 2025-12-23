@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
 };
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,7 @@ enum AppAction {
     StoreHostAgent(IceAgentHandle),
 
     StartConnection(Arc<dyn webrtc_util::Conn + Send + Sync>),
+    SetMicVolume(f32),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -77,6 +78,7 @@ struct App {
     session_offer: Option<String>,
     session_answer: Option<String>,
     host_agent_handle: Option<IceAgentHandle>,
+    mic_volume: f32,
 }
 
 impl App {
@@ -87,7 +89,7 @@ impl App {
 
         Self {
             mode: AppMode::Menu,
-            logs: vec!["callrs - P2P Voice Chat with ICE".into()],
+            logs: vec!["callrs - P2P Voice Chat".into()],
             status: "Ready".into(),
             input: String::new(),
             should_quit: false,
@@ -95,6 +97,7 @@ impl App {
             session_offer: None,
             session_answer: None,
             host_agent_handle: None,
+            mic_volume: 0.0,
         }
     }
 
@@ -423,10 +426,16 @@ async fn capture_processor(
     network_tx: mpsc::Sender<Vec<u8>>,
     is_active: Arc<AtomicBool>,
     sample_rate: u32,
+    action_tx: mpsc::Sender<AppAction>,
 ) {
     let frame_size = ((sample_rate as f32) * 0.02) as usize;
     let mut frame_buf = Vec::with_capacity(frame_size);
     let mut sequence: u32 = 0;
+
+    // For volume calculation
+    let mut vol_sum = 0.0;
+    let mut vol_count = 0;
+    let mut last_vol_update = std::time::Instant::now();
 
     loop {
         if !is_active.load(Ordering::Relaxed) {
@@ -434,6 +443,23 @@ async fn capture_processor(
             continue;
         }
         while let Some(sample) = capture_cons.try_pop() {
+            // Volume Metric (RMS-ish)
+            vol_sum += sample.abs();
+            vol_count += 1;
+
+            // Send volume update ~20Hz
+            if vol_count >= sample_rate as usize / 20 {
+                let avg = vol_sum / vol_count as f32;
+                // Boost a bit for visibility
+                let vol_normalized = (avg * 5.0).clamp(0.0, 1.0);
+                if last_vol_update.elapsed().as_millis() > 50 {
+                    let _ = action_tx.try_send(AppAction::SetMicVolume(vol_normalized));
+                    last_vol_update = std::time::Instant::now();
+                }
+                vol_sum = 0.0;
+                vol_count = 0;
+            }
+
             let s_i16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
             frame_buf.push(s_i16);
             if frame_buf.len() >= frame_size {
@@ -551,18 +577,44 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         chunks[0],
     );
 
-    let logs: Vec<ListItem> = app
-        .logs
-        .iter()
-        .rev()
-        .take(chunks[1].height as usize - 2)
-        .rev()
-        .map(|l| ListItem::new(l.as_str()))
-        .collect();
-    f.render_widget(
-        List::new(logs).block(Block::default().title("Activity").borders(Borders::ALL)),
-        chunks[1],
-    );
+    if let AppMode::InCall(_) = app.mode {
+        let gauge = Gauge::default()
+            .block(Block::default().title("Mic Volume").borders(Borders::ALL))
+            .gauge_style(Style::default().fg(Color::Green))
+            .ratio(app.mic_volume.clamp(0.0, 1.0) as f64);
+
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(chunks[1]);
+
+        let logs: Vec<ListItem> = app
+            .logs
+            .iter()
+            .rev()
+            .take(inner_chunks[0].height as usize)
+            .rev()
+            .map(|l| ListItem::new(l.as_str()))
+            .collect();
+        f.render_widget(
+            List::new(logs).block(Block::default().title("Activity").borders(Borders::ALL)),
+            inner_chunks[0],
+        );
+        f.render_widget(gauge, inner_chunks[1]);
+    } else {
+        let logs: Vec<ListItem> = app
+            .logs
+            .iter()
+            .rev()
+            .take(chunks[1].height as usize - 2)
+            .rev()
+            .map(|l| ListItem::new(l.as_str()))
+            .collect();
+        f.render_widget(
+            List::new(logs).block(Block::default().title("Activity").borders(Borders::ALL)),
+            chunks[1],
+        );
+    }
 
     let (display_text, title) = match &app.mode {
         AppMode::HostWaitingForAnswer { offer } => (
@@ -628,6 +680,9 @@ async fn main() -> Result<()> {
                 AppAction::StoreHostAgent(handle) => {
                     app.host_agent_handle = Some(handle);
                 }
+                AppAction::SetMicVolume(vol) => {
+                    app.mic_volume = vol;
+                }
 
                 AppAction::StartConnection(conn) => {
                     // Setup audio and network
@@ -644,6 +699,7 @@ async fn main() -> Result<()> {
                             ntx,
                             audio.is_active.clone(),
                             audio.sample_rate,
+                            action_tx.clone(),
                         )));
 
                         net_task = Some(tokio::spawn(run_network(
