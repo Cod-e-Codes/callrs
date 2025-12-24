@@ -54,8 +54,6 @@ enum AppMode {
 
 enum AppAction {
     Log(String),
-    #[allow(dead_code)]
-    Status(String),
     SetMode(AppMode),
     Input(event::KeyEvent),
     SetOffer(String),
@@ -84,8 +82,6 @@ struct SessionAnswer {
 struct App {
     mode: AppMode,
     logs: Vec<String>,
-    #[allow(dead_code)]
-    status: String,
     input: String,
     should_quit: bool,
     local_ip: String,
@@ -105,7 +101,6 @@ impl App {
         Self {
             mode: AppMode::Menu,
             logs: vec!["callrs - P2P Voice Chat".into()],
-            status: "Ready".into(),
             input: String::new(),
             should_quit: false,
             local_ip,
@@ -1278,7 +1273,6 @@ async fn main() -> Result<()> {
                         _ => {}
                     }
                 }
-                _ => {}
             }
         }
         if app.should_quit {
