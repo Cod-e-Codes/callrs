@@ -50,6 +50,7 @@ enum AppMode {
     ClientGeneratingAnswer { answer: String },
     IceConnecting,
     InCall(String),
+    Error(String),
 }
 
 enum AppAction {
@@ -845,6 +846,13 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             let mute_status = if app.is_muted { " | MUTED" } else { "" };
             format!("IN CALL: {}{}", peer, mute_status)
         }
+        AppMode::Error(msg) => format!("ERROR: {}", msg),
+    };
+
+    let status_color = if matches!(app.mode, AppMode::Error(_)) {
+        Color::Red
+    } else {
+        Color::Yellow
     };
 
     f.render_widget(
@@ -856,7 +864,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" | "),
-            Span::styled(status, Style::default().fg(Color::Yellow)),
+            Span::styled(status, Style::default().fg(status_color)),
         ]))
         .block(Block::default().borders(Borders::ALL)),
         chunks[0],
@@ -921,6 +929,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         AppMode::ClientGeneratingAnswer { answer } => {
             (answer.as_str(), "Your Answer (send to host)")
         }
+        AppMode::Error(msg) => (msg.as_str(), "Error (press ESC to dismiss)"),
         _ => (app.input.as_str(), "Input / Session Data"),
     };
 
@@ -1060,9 +1069,12 @@ async fn main() -> Result<()> {
                                             .await;
                                     }
                                     Err(e) => {
-                                        let _ =
-                                            tx.send(AppAction::Log(format!("Error: {}", e))).await;
-                                        let _ = tx.send(AppAction::SetMode(AppMode::Menu)).await;
+                                        let error_msg =
+                                            format!("Failed to gather ICE candidates: {}", e);
+                                        let _ = tx.send(AppAction::Log(error_msg.clone())).await;
+                                        let _ = tx
+                                            .send(AppAction::SetMode(AppMode::Error(error_msg)))
+                                            .await;
                                     }
                                 }
                             });
@@ -1141,14 +1153,15 @@ async fn main() -> Result<()> {
                                                     tx.send(AppAction::StartConnection(conn)).await;
                                             }
                                             Err(e) => {
+                                                let error_msg =
+                                                    format!("ICE connection failed: {}", e);
                                                 let _ = tx
-                                                    .send(AppAction::Log(format!(
-                                                        "Accept error: {}",
-                                                        e
-                                                    )))
+                                                    .send(AppAction::Log(error_msg.clone()))
                                                     .await;
                                                 let _ = tx
-                                                    .send(AppAction::SetMode(AppMode::Menu))
+                                                    .send(AppAction::SetMode(AppMode::Error(
+                                                        error_msg,
+                                                    )))
                                                     .await;
                                             }
                                         }
@@ -1221,24 +1234,27 @@ async fn main() -> Result<()> {
                                                         .await;
                                                 }
                                                 Err(e) => {
+                                                    let error_msg =
+                                                        format!("ICE connection failed: {}", e);
                                                     let _ = tx
-                                                        .send(AppAction::Log(format!(
-                                                            "Dial error: {}",
-                                                            e
-                                                        )))
+                                                        .send(AppAction::Log(error_msg.clone()))
                                                         .await;
                                                     let _ = tx
-                                                        .send(AppAction::SetMode(AppMode::Menu))
+                                                        .send(AppAction::SetMode(AppMode::Error(
+                                                            error_msg,
+                                                        )))
                                                         .await;
                                                 }
                                             }
                                         }
                                         Err(e) => {
-                                            let _ = tx
-                                                .send(AppAction::Log(format!("Error: {}", e)))
-                                                .await;
+                                            let error_msg =
+                                                format!("Failed to gather ICE candidates: {}", e);
                                             let _ =
-                                                tx.send(AppAction::SetMode(AppMode::Menu)).await;
+                                                tx.send(AppAction::Log(error_msg.clone())).await;
+                                            let _ = tx
+                                                .send(AppAction::SetMode(AppMode::Error(error_msg)))
+                                                .await;
                                         }
                                     }
                                 });
@@ -1257,18 +1273,23 @@ async fn main() -> Result<()> {
                             app.input.pop();
                         }
 
-                        // ESC to cancel/end
+                        // ESC to cancel/end or dismiss error
                         (_, KeyCode::Esc) => {
                             if let Some(s) = session.take() {
                                 s.stop().await;
                             }
                             app.host_agent_handle = None;
 
-                            app.mode = AppMode::Menu;
-                            app.session_offer = None;
-                            app.session_answer = None;
-                            app.input.clear();
-                            app.is_muted = false;
+                            // If in error mode, just go back to menu. Otherwise, clear everything.
+                            if matches!(app.mode, AppMode::Error(_)) {
+                                app.mode = AppMode::Menu;
+                            } else {
+                                app.mode = AppMode::Menu;
+                                app.session_offer = None;
+                                app.session_answer = None;
+                                app.input.clear();
+                                app.is_muted = false;
+                            }
                         }
                         _ => {}
                     }
