@@ -174,13 +174,15 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
         .supported_input_configs()?
         .find(|c| c.min_sample_rate() <= SAMPLE_RATE && c.max_sample_rate() >= SAMPLE_RATE)
         .map(|c| c.with_sample_rate(SAMPLE_RATE))
-        .unwrap_or_else(|| input_dev.default_input_config().unwrap());
+        .or_else(|| input_dev.default_input_config().ok())
+        .context("No supported input audio configuration available")?;
 
     let out_cfg = output_dev
         .supported_output_configs()?
         .find(|c| c.min_sample_rate() <= SAMPLE_RATE && c.max_sample_rate() >= SAMPLE_RATE)
         .map(|c| c.with_sample_rate(SAMPLE_RATE))
-        .unwrap_or_else(|| output_dev.default_output_config().unwrap());
+        .or_else(|| output_dev.default_output_config().ok())
+        .context("No supported output audio configuration available")?;
 
     // Get actual sample rates (may differ from 48kHz if device doesn't support it)
     let input_sample_rate: u32 = in_cfg.sample_rate();
@@ -558,12 +560,20 @@ async fn capture_processor(
     action_tx: mpsc::Sender<AppAction>,
 ) {
     // Opus Encoder setup
-    let encoder = OpusEncoder::new(
+    let encoder = match OpusEncoder::new(
         OpusSampleRate::Hz48000,
         OpusChannels::Mono,
         OpusApplication::Voip,
-    )
-    .expect("Failed to create Opus encoder");
+    ) {
+        Ok(enc) => enc,
+        Err(e) => {
+            let _ = action_tx.try_send(AppAction::Log(format!(
+                "Critical: Failed to create Opus encoder: {:?}. Audio capture cannot continue.",
+                e
+            )));
+            return; // Task exits if encoder cannot be created
+        }
+    };
 
     let frame_size = FRAME_SIZE;
     let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_size);
@@ -582,7 +592,17 @@ async fn capture_processor(
         // output_needed ~ 960. ratio = 48000 / sample_rate.
         let chunk_in = 1024;
         let ratio = 48000.0 / sample_rate as f64;
-        Some(SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_in, 1).unwrap())
+        match SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_in, 1) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                let _ = action_tx
+                    .try_send(AppAction::Log(format!(
+                        "Warning: Failed to create input resampler ({} -> 48kHz): {:?}. Audio quality may be degraded.",
+                        sample_rate, e
+                    )));
+                None // Continue without resampling
+            }
+        }
     } else {
         None
     };
@@ -718,8 +738,18 @@ async fn run_network(
     let mut buffering = true;
 
     // Opus Decoder
-    let mut decoder = OpusDecoder::new(OpusSampleRate::Hz48000, OpusChannels::Mono)
-        .expect("Failed to create Opus decoder");
+    let mut decoder = match OpusDecoder::new(OpusSampleRate::Hz48000, OpusChannels::Mono) {
+        Ok(dec) => dec,
+        Err(e) => {
+            let _ = action_tx
+                .send(AppAction::Log(format!(
+                    "Critical: Failed to create Opus decoder: {:?}. Audio playback cannot continue.",
+                    e
+                )))
+                .await;
+            return; // Task exits if decoder cannot be created
+        }
+    };
 
     let mut decoded_pcm = vec![0i16; FRAME_SIZE];
 
@@ -1045,9 +1075,10 @@ async fn main() -> Result<()> {
 
                         // Host receives answer and completes connection
                         (AppMode::HostWaitingForAnswer { .. }, KeyCode::Enter) => {
-                            if !app.input.is_empty() && app.host_agent_handle.is_some() {
+                            if !app.input.is_empty()
+                                && let Some(agent_handle) = app.host_agent_handle.take()
+                            {
                                 let answer_b64 = app.input.clone();
-                                let agent_handle = app.host_agent_handle.take().unwrap();
                                 let tx = action_tx.clone();
 
                                 app.mode = AppMode::IceConnecting;
