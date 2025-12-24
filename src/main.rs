@@ -27,6 +27,8 @@ use std::{
 use tokio::sync::mpsc;
 
 use rubato::{Resampler, SincFixedIn};
+use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use audiopus::{
     Application as OpusApplication, Channels as OpusChannels, SampleRate as OpusSampleRate,
@@ -127,7 +129,8 @@ struct AudioHandle {
     _streams: (cpal::Stream, cpal::Stream),
     is_active: Arc<AtomicBool>,
     is_muted: Arc<AtomicBool>,
-    sample_rate: u32,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
 }
 
 impl AudioHandle {
@@ -179,11 +182,12 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
         .map(|c| c.with_sample_rate(SAMPLE_RATE))
         .unwrap_or_else(|| output_dev.default_output_config().unwrap());
 
-    // Fallback if we couldn't get 48kHz
-    let sample_rate: u32 = in_cfg.sample_rate();
-    if sample_rate != SAMPLE_RATE {
-        // In a production app we'd resample.
-    }
+    // Get actual sample rates (may differ from 48kHz if device doesn't support it)
+    let input_sample_rate: u32 = in_cfg.sample_rate();
+    let output_sample_rate: u32 = out_cfg.sample_rate();
+
+    // Note: Input resampling (from device rate to 48kHz) is handled in capture_processor.
+    // Output resampling (from 48kHz to device rate) is handled in the output stream callback below.
 
     let in_channels = in_cfg.channels() as usize;
     let out_channels = out_cfg.channels() as usize;
@@ -216,6 +220,36 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
 
     let active_out = is_active.clone();
     let mut playback_cons_f32 = playback_cons;
+
+    // Setup output resampling if needed (playback buffer is 48kHz, device may be different)
+    let output_needs_resampling = output_sample_rate != SAMPLE_RATE;
+    let resampler_state: Option<RefCell<(SincFixedIn<f32>, VecDeque<f32>)>> =
+        if output_needs_resampling {
+            let params = rubato::SincInterpolationParameters {
+                sinc_len: 256,
+                f_cutoff: 0.95,
+                interpolation: rubato::SincInterpolationType::Linear,
+                window: rubato::WindowFunction::BlackmanHarris2,
+                oversampling_factor: 128,
+            };
+            // Resample FROM 48kHz (buffer) TO output_sample_rate (device)
+            // ratio = output_rate / input_rate = output_sample_rate / 48000.0
+            let ratio = output_sample_rate as f64 / SAMPLE_RATE as f64;
+            // Input chunk size: approximate 20ms at 48kHz = ~960 samples
+            let chunk_in = 960;
+            match SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_in, 1) {
+                Ok(resampler) => Some(RefCell::new((resampler, VecDeque::new()))),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to create output resampler: {:?}",
+                        e
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
     let output_stream = output_dev.build_output_stream(
         &out_cfg.config(),
         move |data: &mut [f32], _| {
@@ -223,9 +257,47 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
                 data.fill(0.0);
                 return;
             }
-            for frame in data.chunks_exact_mut(out_channels) {
-                let sample = playback_cons_f32.try_pop().unwrap_or(0.0);
-                frame.fill(sample);
+
+            if let Some(ref resampler_cell) = resampler_state {
+                // Output resampling path: 48kHz buffer -> device sample rate
+                let mut resampler_state = resampler_cell.borrow_mut();
+                let (resampler, resampled_buffer) = &mut *resampler_state;
+
+                // Fill output buffer with resampled samples
+                for frame in data.chunks_exact_mut(out_channels) {
+                    // Get sample from resampled buffer, or resample more if needed
+                    if resampled_buffer.is_empty() {
+                        // Need to resample more samples
+                        let input_chunk_size = resampler.input_frames_next();
+                        let mut input_chunk = Vec::with_capacity(input_chunk_size);
+
+                        // Collect 48kHz samples from the playback buffer
+                        for _ in 0..input_chunk_size {
+                            if let Some(sample) = playback_cons_f32.try_pop() {
+                                input_chunk.push(sample);
+                            } else {
+                                input_chunk.push(0.0); // Underrun: pad with silence
+                            }
+                        }
+
+                        // Resample the chunk
+                        if let Ok(output) = resampler.process(&[input_chunk], None)
+                            && let Some(chan0) = output.first()
+                        {
+                            resampled_buffer.extend(chan0.iter().copied());
+                        }
+                    }
+
+                    // Use resampled sample, or silence if buffer is still empty
+                    let sample = resampled_buffer.pop_front().unwrap_or(0.0);
+                    frame.fill(sample);
+                }
+            } else {
+                // Direct path: 48kHz buffer -> 48kHz device (no resampling)
+                for frame in data.chunks_exact_mut(out_channels) {
+                    let sample = playback_cons_f32.try_pop().unwrap_or(0.0);
+                    frame.fill(sample);
+                }
             }
         },
         |_| {},
@@ -239,7 +311,8 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
         _streams: (input_stream, output_stream),
         is_active,
         is_muted,
-        sample_rate,
+        input_sample_rate,
+        output_sample_rate,
     })
 }
 
@@ -904,7 +977,7 @@ async fn main() -> Result<()> {
                             cap_cons,
                             ntx,
                             audio.is_active.clone(),
-                            audio.sample_rate,
+                            audio.input_sample_rate,
                             action_tx.clone(),
                         ));
 
@@ -914,7 +987,7 @@ async fn main() -> Result<()> {
                             play_prod,
                             action_tx.clone(),
                             audio.is_active.clone(),
-                            audio.sample_rate,
+                            audio.output_sample_rate,
                         ));
 
                         session = Some(CallSession {
