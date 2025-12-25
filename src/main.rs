@@ -36,6 +36,11 @@ use audiopus::{
     coder::{Decoder as OpusDecoder, Encoder as OpusEncoder},
 };
 
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, OsRng},
+};
+
 const SAMPLE_RATE: u32 = 48000; // API requires 48k for best Opus compatibility
 const FRAME_DURATION_MS: u32 = 20;
 const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize; // 960 samples
@@ -86,6 +91,11 @@ const RESAMPLER_OVERSAMPLING_FACTOR: usize = 128; // Oversampling factor for qua
 const RESAMPLER_CHUNK_SIZE_OUTPUT: usize = 960; // Output chunk size (~20ms at 48kHz)
 const RESAMPLER_CHUNK_SIZE_INPUT: usize = 1024; // Input chunk size for capture resampling
 
+// Encryption configuration (ChaCha20Poly1305)
+const ENCRYPTION_KEY_SIZE_BYTES: usize = 32; // ChaCha20Poly1305 key size
+const ENCRYPTION_NONCE_SIZE_BYTES: usize = 12; // ChaCha20Poly1305 nonce size
+const ENCRYPTION_SEQUENCE_BYTES: usize = 4; // Bytes from sequence number used in nonce
+
 #[derive(Clone, Debug, PartialEq)]
 enum AppMode {
     Menu,
@@ -114,7 +124,10 @@ enum AppAction {
     SetAnswer(String),
     StoreHostAgent(IceAgentHandle),
 
-    StartConnection(Arc<dyn webrtc_util::Conn + Send + Sync>),
+    StartConnection {
+        conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
+        encryption_key: Option<String>,
+    },
     SetMicVolume(f32),
     SetReceiveVolume(f32),
     SetLatency(f32),
@@ -127,6 +140,7 @@ struct SessionOffer {
     ufrag: String,
     pwd: String,
     candidates: Vec<String>,
+    encryption_key: String, // Base64-encoded 32-byte encryption key
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -411,6 +425,54 @@ fn try_upnp_cleanup(local_port: u16) {
     }
 }
 
+// Encryption helpers
+fn generate_encryption_key() -> String {
+    let key = ChaCha20Poly1305::generate_key(&mut OsRng);
+    BASE64_STANDARD.encode(key.as_slice())
+}
+
+fn parse_encryption_key(key_b64: &str) -> Result<Key> {
+    let key_bytes = BASE64_STANDARD
+        .decode(key_b64)
+        .map_err(|_| anyhow::anyhow!("Invalid encryption key format"))?;
+    if key_bytes.len() != ENCRYPTION_KEY_SIZE_BYTES {
+        return Err(anyhow::anyhow!(
+            "Encryption key must be {} bytes",
+            ENCRYPTION_KEY_SIZE_BYTES
+        ));
+    }
+    Ok(*Key::from_slice(&key_bytes))
+}
+
+// Encrypt packet: nonce + encrypted payload
+// Nonce is derived from sequence number to ensure uniqueness
+fn encrypt_packet(data: &[u8], key: &Key, sequence: u32) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(key);
+
+    // Use sequence number as nonce (little-endian, zero-padded to nonce size)
+    let mut nonce_bytes = [0u8; ENCRYPTION_NONCE_SIZE_BYTES];
+    nonce_bytes[..ENCRYPTION_SEQUENCE_BYTES].copy_from_slice(&sequence.to_le_bytes());
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    cipher
+        .encrypt(nonce, data)
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {:?}", e))
+}
+
+// Decrypt packet: expects nonce (derived from sequence) + encrypted payload
+fn decrypt_packet(encrypted: &[u8], key: &Key, sequence: u32) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(key);
+
+    // Use sequence number as nonce (little-endian, zero-padded to nonce size)
+    let mut nonce_bytes = [0u8; ENCRYPTION_NONCE_SIZE_BYTES];
+    nonce_bytes[..ENCRYPTION_SEQUENCE_BYTES].copy_from_slice(&sequence.to_le_bytes());
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    cipher
+        .decrypt(nonce, encrypted)
+        .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))
+}
+
 use webrtc_ice::{
     agent::{Agent, agent_config::AgentConfig},
     network_type::NetworkType,
@@ -445,6 +507,7 @@ struct IceAgentHandle {
     agent: Arc<Agent>,
     ufrag: String,
     pwd: String,
+    encryption_key: Option<String>, // Encryption key for this session
 }
 
 async fn host_gather_candidates(action_tx: mpsc::Sender<AppAction>) -> Result<IceAgentHandle> {
@@ -483,11 +546,15 @@ async fn host_gather_candidates(action_tx: mpsc::Sender<AppAction>) -> Result<Ic
         )))
         .await;
 
+    // Generate encryption key for this session
+    let encryption_key = generate_encryption_key();
+
     // Create offer
     let offer = SessionOffer {
         ufrag: ufrag.clone(),
         pwd: pwd.clone(),
         candidates: candidates.iter().map(|c| c.marshal()).collect(),
+        encryption_key: encryption_key.clone(),
     };
 
     let offer_json = serde_json::to_string(&offer)?;
@@ -504,6 +571,7 @@ async fn host_gather_candidates(action_tx: mpsc::Sender<AppAction>) -> Result<Ic
         agent: Arc::new(agent),
         ufrag,
         pwd,
+        encryption_key: Some(encryption_key),
     })
 }
 
@@ -616,6 +684,7 @@ async fn client_gather_candidates(
         agent: Arc::new(agent),
         ufrag: offer.ufrag,
         pwd: offer.pwd,
+        encryption_key: Some(offer.encryption_key),
     })
 }
 
@@ -645,6 +714,7 @@ async fn capture_processor(
     is_active: Arc<AtomicBool>,
     sample_rate: u32,
     action_tx: mpsc::Sender<AppAction>,
+    encryption_key: Option<Key>,
 ) {
     // Opus Encoder setup
     let encoder = match OpusEncoder::new(
@@ -818,9 +888,30 @@ async fn capture_processor(
             // Encode
             match encoder.encode(&pcm_buf, &mut opus_buf) {
                 Ok(len) => {
-                    let mut packet = Vec::with_capacity(4 + len);
+                    let opus_payload = &opus_buf[..len];
+
+                    // Encrypt opus payload if encryption key is available
+                    let encrypted_payload = if let Some(ref key) = encryption_key {
+                        match encrypt_packet(opus_payload, key, sequence) {
+                            Ok(encrypted) => encrypted,
+                            Err(e) => {
+                                try_send_action(
+                                    &action_tx,
+                                    AppAction::Log(format!("Encryption error: {}", e)),
+                                    &mut dropped_ui_messages,
+                                    &mut last_ui_drop_log,
+                                );
+                                continue; // Skip this packet if encryption fails
+                            }
+                        }
+                    } else {
+                        opus_payload.to_vec()
+                    };
+
+                    // Packet format: [sequence(4 bytes)][encrypted_payload]
+                    let mut packet = Vec::with_capacity(4 + encrypted_payload.len());
                     packet.extend_from_slice(&sequence.to_le_bytes());
-                    packet.extend_from_slice(&opus_buf[..len]);
+                    packet.extend_from_slice(&encrypted_payload);
 
                     match network_tx.try_send(packet) {
                         Ok(_) => {}
@@ -989,7 +1080,25 @@ async fn run_network(
     action_tx: mpsc::Sender<AppAction>,
     _is_active: Arc<AtomicBool>,
     _sample_rate: u32,
+    encryption_key: Option<String>,
 ) {
+    // Setup encryption if key is provided
+    let cipher_key = if let Some(ref key_str) = encryption_key {
+        match parse_encryption_key(key_str) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                let _ = action_tx
+                    .send(AppAction::Log(format!(
+                        "Warning: Failed to parse encryption key: {}. Connection will proceed without encryption.",
+                        e
+                    )))
+                    .await;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut buf = vec![0u8; 8192];
     let mut jitter_buffer = AdaptiveJitterBuffer::new();
     let mut initial_buffering = true;
@@ -1049,67 +1158,85 @@ async fn run_network(
             res = conn.recv(&mut buf) => {
                 match res {
                     Ok(len) => {
-                        if len > 4 {
-                            // Extract sequence number
-                            let received_sequence = u32::from_le_bytes([
-                                buf[0], buf[1], buf[2], buf[3]
-                            ]);
+                        if len <= 4 {
+                            continue; // Invalid packet (need at least sequence number)
+                        }
 
-                            // Opus payload (skip 4 byte sequence)
-                            let opus_payload = &buf[4..len];
+                        // Extract sequence number (unencrypted)
+                        let received_sequence = u32::from_le_bytes([
+                            buf[0], buf[1], buf[2], buf[3]
+                        ]);
 
-                            // Packet Loss Concealment: detect missing packets
-                            if let Some(expected) = expected_sequence {
-                                let gap = received_sequence.wrapping_sub(expected);
-                                if gap > 0 {
-                                    if gap > MAX_PACKET_GAP_FOR_PLC {
-                                        // Log significant packet loss (200ms+)
-                                        try_send_action(&action_tx, AppAction::Log(format!(
-                                            "Warning: Large packet gap detected ({} packets, {}ms+)",
-                                            gap,
-                                            gap * FRAME_DURATION_MS
-                                        )), &mut dropped_ui_messages, &mut last_ui_drop_log);
-                                    }
-                                    // Handle gaps up to MAX_PACKET_GAP_FOR_PLC packets (200ms)
-                                    if gap <= MAX_PACKET_GAP_FOR_PLC {
-                                        // Perform PLC: repeat last frame with fade-out for missing packets
-                                        if let Some(ref last_frame) = last_decoded_frame {
-                                            for i in 0..(gap - 1) {
-                                                let fade_factor = 1.0 - (i as f32 / gap as f32);
-                                                // Generate faded frame
-                                                let faded_frame: Vec<f32> = last_frame
-                                                    .iter()
-                                                    .map(|&s| s * fade_factor)
-                                                    .collect();
+                        // Decrypt opus payload if encryption is enabled
+                        let opus_payload = if let Some(ref key) = cipher_key {
+                            match decrypt_packet(&buf[4..len], key, received_sequence) {
+                                Ok(decrypted) => decrypted,
+                                Err(e) => {
+                                    try_send_action(
+                                        &action_tx,
+                                        AppAction::Log(format!("Decryption error: {}", e)),
+                                        &mut dropped_ui_messages,
+                                        &mut last_ui_drop_log,
+                                    );
+                                    continue; // Skip this packet if decryption fails
+                                }
+                            }
+                        } else {
+                            buf[4..len].to_vec()
+                        };
 
-                                                // Update receive volume for PLC frames
-                                                let plc_vol = calculate_volume(&faded_frame);
-                                                try_send_action(&action_tx, AppAction::SetReceiveVolume(plc_vol), &mut dropped_ui_messages, &mut last_ui_drop_log);
+                        // Packet Loss Concealment: detect missing packets
+                        if let Some(expected) = expected_sequence {
+                            let gap = received_sequence.wrapping_sub(expected);
+                            if gap > 0 {
+                                if gap > MAX_PACKET_GAP_FOR_PLC {
+                                    // Log significant packet loss (200ms+)
+                                    try_send_action(&action_tx, AppAction::Log(format!(
+                                        "Warning: Large packet gap detected ({} packets, {}ms+)",
+                                        gap,
+                                        gap * FRAME_DURATION_MS
+                                    )), &mut dropped_ui_messages, &mut last_ui_drop_log);
+                                }
+                                // Handle gaps up to MAX_PACKET_GAP_FOR_PLC packets (200ms)
+                                if gap <= MAX_PACKET_GAP_FOR_PLC {
+                                    // Perform PLC: repeat last frame with fade-out for missing packets
+                                    if let Some(ref last_frame) = last_decoded_frame {
+                                        for i in 0..(gap - 1) {
+                                            let fade_factor = 1.0 - (i as f32 / gap as f32);
+                                            // Generate faded frame
+                                            let faded_frame: Vec<f32> = last_frame
+                                                .iter()
+                                                .map(|&s| s * fade_factor)
+                                                .collect();
 
-                                                // Push faded samples (buffer overflow check happens after decode)
-                                                for &sample in &faded_frame {
-                                                    if playback_prod.try_push(sample).is_err() {
-                                                        dropped_frames += 1;
-                                                    }
+                                            // Update receive volume for PLC frames
+                                            let plc_vol = calculate_volume(&faded_frame);
+                                            try_send_action(&action_tx, AppAction::SetReceiveVolume(plc_vol), &mut dropped_ui_messages, &mut last_ui_drop_log);
+
+                                            // Push faded samples (buffer overflow check happens after decode)
+                                            for &sample in &faded_frame {
+                                                if playback_prod.try_push(sample).is_err() {
+                                                    dropped_frames += 1;
                                                 }
                                             }
-                                        } else {
-                                            // No previous frame, insert silence (zero volume)
-                                            try_send_action(&action_tx, AppAction::SetReceiveVolume(0.0), &mut dropped_ui_messages, &mut last_ui_drop_log);
-                                            for _ in 0..(gap - 1) {
-                                                for _ in 0..FRAME_SIZE {
-                                                    if playback_prod.try_push(0.0).is_err() {
-                                                        dropped_frames += 1;
-                                                    }
+                                        }
+                                    } else {
+                                        // No previous frame, insert silence (zero volume)
+                                        try_send_action(&action_tx, AppAction::SetReceiveVolume(0.0), &mut dropped_ui_messages, &mut last_ui_drop_log);
+                                        for _ in 0..(gap - 1) {
+                                            for _ in 0..FRAME_SIZE {
+                                                if playback_prod.try_push(0.0).is_err() {
+                                                    dropped_frames += 1;
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-                            expected_sequence = Some(received_sequence.wrapping_add(1));
+                        }
+                        expected_sequence = Some(received_sequence.wrapping_add(1));
 
-                            match decoder.decode(Some(opus_payload), &mut decoded_pcm, false) {
+                        match decoder.decode(Some(&opus_payload), &mut decoded_pcm, false) {
                                 Ok(samples_len) => {
                                     // Record packet arrival for jitter calculation
                                     let now = std::time::Instant::now();
@@ -1170,7 +1297,6 @@ async fn run_network(
                                      let _ = action_tx.send(AppAction::Log(format!("Opus decode error: {:?}", e))).await;
                                 }
                             }
-                        }
                     }
                     Err(e) => {
                         let _ = action_tx.send(AppAction::Log(
@@ -1458,11 +1584,32 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                AppAction::StartConnection(conn) => {
+                AppAction::StartConnection {
+                    conn,
+                    encryption_key,
+                } => {
                     // Setup audio and network
                     let (ntx, nrx) = mpsc::channel(NETWORK_CHANNEL_BUFFER_SIZE);
                     let (cap_prod, cap_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
                     let (play_prod, play_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
+
+                    // Parse encryption key if provided
+                    let cipher_key = if let Some(ref key_str) = encryption_key {
+                        match parse_encryption_key(key_str) {
+                            Ok(key) => Some(key),
+                            Err(e) => {
+                                let _ = action_tx
+                                    .send(AppAction::Log(format!(
+                                        "Warning: Failed to parse encryption key: {}. Connection will proceed without encryption.",
+                                        e
+                                    )))
+                                    .await;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     match setup_audio(cap_prod, play_cons) {
                         Ok(audio) => {
@@ -1474,6 +1621,7 @@ async fn main() -> Result<()> {
                                 audio.is_active.clone(),
                                 audio.input_sample_rate,
                                 action_tx.clone(),
+                                cipher_key,
                             ));
 
                             let net_task = tokio::spawn(run_network(
@@ -1483,6 +1631,7 @@ async fn main() -> Result<()> {
                                 action_tx.clone(),
                                 audio.is_active.clone(),
                                 audio.output_sample_rate,
+                                encryption_key,
                             ));
 
                             session = Some(CallSession {
@@ -1637,8 +1786,14 @@ async fn main() -> Result<()> {
                                                         .await;
                                                 }
 
-                                                let _ =
-                                                    tx.send(AppAction::StartConnection(conn)).await;
+                                                let encryption_key =
+                                                    agent_handle.encryption_key.clone();
+                                                let _ = tx
+                                                    .send(AppAction::StartConnection {
+                                                        conn,
+                                                        encryption_key,
+                                                    })
+                                                    .await;
                                             }
                                             Err(e) => {
                                                 let error_msg =
@@ -1733,8 +1888,13 @@ async fn main() -> Result<()> {
                                                             .await;
                                                     }
 
+                                                    let encryption_key =
+                                                        agent_handle.encryption_key.clone();
                                                     let _ = tx
-                                                        .send(AppAction::StartConnection(conn))
+                                                        .send(AppAction::StartConnection {
+                                                            conn,
+                                                            encryption_key,
+                                                        })
                                                         .await;
                                                 }
                                                 Err(e) => {
@@ -2323,6 +2483,7 @@ mod tests {
             ufrag: "test_ufrag".to_string(),
             pwd: "test_password".to_string(),
             candidates: vec!["candidate1".to_string(), "candidate2".to_string()],
+            encryption_key: "dGVzdF9lbmNyeXB0aW9uX2tleV9mb3JfdGVzdGluZw==".to_string(),
         };
 
         let json = serde_json::to_string(&offer).expect("Should serialize");
@@ -2357,19 +2518,114 @@ mod tests {
             ufrag: "test_ufrag".to_string(),
             pwd: "test_password".to_string(),
             candidates: vec!["candidate1".to_string()],
+            encryption_key: "dGVzdF9lbmNyeXB0aW9uX2tleV9mb3JfdGVzdGluZw==".to_string(),
         };
 
         let json = serde_json::to_string(&offer).expect("Should serialize");
         let b64 = BASE64_STANDARD.encode(&json);
         let decoded = BASE64_STANDARD.decode(&b64).expect("Should decode");
         let decoded_json = String::from_utf8(decoded).expect("Should be valid UTF-8");
-        let deserialized: SessionOffer =
+        let decoded_offer: SessionOffer =
             serde_json::from_str(&decoded_json).expect("Should deserialize");
 
         assert_eq!(
-            offer, deserialized,
+            offer, decoded_offer,
             "Base64 roundtrip should preserve offer"
         );
+    }
+
+    // ============================================================================
+    // Tests for Encryption
+    // ============================================================================
+
+    #[test]
+    fn test_encryption_key_generation_produces_valid_key() {
+        let key_b64 = generate_encryption_key();
+        assert!(!key_b64.is_empty(), "Generated key should not be empty");
+
+        // Should be able to parse the generated key
+        let key = parse_encryption_key(&key_b64);
+        assert!(key.is_ok(), "Generated key should be parseable");
+        assert_eq!(key.unwrap().as_slice().len(), ENCRYPTION_KEY_SIZE_BYTES);
+    }
+
+    #[test]
+    fn test_encryption_key_parsing_rejects_invalid_base64() {
+        let invalid_key = "not-valid-base64!!!";
+        let result = parse_encryption_key(invalid_key);
+        assert!(result.is_err(), "Should reject invalid base64");
+    }
+
+    #[test]
+    fn test_encryption_key_parsing_rejects_wrong_size() {
+        // Create a valid base64 string that decodes to wrong size
+        let wrong_size_key = BASE64_STANDARD.encode(&[0u8; 16]); // 16 bytes instead of 32
+        let result = parse_encryption_key(&wrong_size_key);
+        assert!(result.is_err(), "Should reject key with wrong size");
+    }
+
+    #[test]
+    fn test_encryption_decryption_roundtrip() {
+        let key_b64 = generate_encryption_key();
+        let key = parse_encryption_key(&key_b64).expect("Should parse valid key");
+
+        let test_data = b"Hello, encrypted world!";
+        let sequence = 42u32;
+
+        // Encrypt
+        let encrypted =
+            encrypt_packet(test_data, &key, sequence).expect("Encryption should succeed");
+
+        // Decrypt
+        let decrypted =
+            decrypt_packet(&encrypted, &key, sequence).expect("Decryption should succeed");
+
+        assert_eq!(
+            test_data,
+            decrypted.as_slice(),
+            "Decrypted data should match original"
+        );
+    }
+
+    #[test]
+    fn test_encryption_fails_with_wrong_sequence() {
+        let key_b64 = generate_encryption_key();
+        let key = parse_encryption_key(&key_b64).expect("Should parse valid key");
+
+        let test_data = b"Test data";
+        let sequence = 100u32;
+
+        let encrypted =
+            encrypt_packet(test_data, &key, sequence).expect("Encryption should succeed");
+
+        // Try to decrypt with wrong sequence number
+        let wrong_sequence = 101u32;
+        let result = decrypt_packet(&encrypted, &key, wrong_sequence);
+
+        assert!(
+            result.is_err(),
+            "Decryption should fail with wrong sequence number"
+        );
+    }
+
+    #[test]
+    fn test_encryption_fails_with_wrong_key() {
+        let key1_b64 = generate_encryption_key();
+        let key1 = parse_encryption_key(&key1_b64).expect("Should parse valid key");
+
+        let key2_b64 = generate_encryption_key();
+        let key2 = parse_encryption_key(&key2_b64).expect("Should parse valid key");
+
+        let test_data = b"Test data";
+        let sequence = 50u32;
+
+        let encrypted =
+            encrypt_packet(test_data, &key1, sequence).expect("Encryption should succeed");
+
+        // Try to decrypt with different key
+        let result = decrypt_packet(&encrypted, &key2, sequence);
+
+        assert!(result.is_err(), "Decryption should fail with wrong key");
     }
 
     #[test]
