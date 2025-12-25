@@ -42,6 +42,10 @@ const FRAME_SIZE: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize; // 
 
 const BUFFER_SIZE: usize = 19200;
 
+// Noise gate threshold: RMS amplitude below this value will be considered silence
+// Value is in normalized range [0.0, 1.0] where 1.0 is full scale
+const NOISE_GATE_THRESHOLD: f32 = 0.01; // ~1% of full scale, adjustable
+
 #[derive(Clone, Debug, PartialEq)]
 enum AppMode {
     Menu,
@@ -665,6 +669,21 @@ async fn capture_processor(
         while f32_capture_buffer.len() >= frame_size {
             // Take exactly frame_size
             let frame_samples: Vec<f32> = f32_capture_buffer.drain(0..frame_size).collect();
+
+            // Calculate RMS (Root Mean Square) for noise gate
+            let rms = (frame_samples.iter().map(|s| s * s).sum::<f32>() / frame_size as f32).sqrt();
+
+            // Noise gate: skip encoding if below threshold
+            if rms < NOISE_GATE_THRESHOLD {
+                // Still update volume display to show silence
+                vol_sum = 0.0;
+                vol_count = frame_size;
+                if last_vol_update.elapsed().as_millis() > 50 {
+                    let _ = action_tx.try_send(AppAction::SetMicVolume(0.0));
+                    last_vol_update = std::time::Instant::now();
+                }
+                continue; // Skip encoding and sending this frame
+            }
 
             // Calc volume & Convert to i16
             for sample in frame_samples {
