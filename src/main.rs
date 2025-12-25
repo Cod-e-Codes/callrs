@@ -777,6 +777,10 @@ async fn run_network(
     let mut dropped_frames = 0u64;
     let mut last_drop_log = std::time::Instant::now();
 
+    // Packet loss concealment: track expected sequence number and last frame
+    let mut expected_sequence: Option<u32> = None;
+    let mut last_decoded_frame: Option<Vec<f32>> = None;
+
     loop {
         // Log drops
         if dropped_frames > 0 && last_drop_log.elapsed().as_secs() >= 5 {
@@ -799,8 +803,47 @@ async fn run_network(
                 match res {
                     Ok(len) => {
                         if len > 4 {
+                            // Extract sequence number
+                            let received_sequence = u32::from_le_bytes([
+                                buf[0], buf[1], buf[2], buf[3]
+                            ]);
+
                             // Opus payload (skip 4 byte sequence)
                             let opus_payload = &buf[4..len];
+
+                            // Packet Loss Concealment: detect missing packets
+                            if let Some(expected) = expected_sequence {
+                                let gap = received_sequence.wrapping_sub(expected);
+                                // If gap > 0, we have missing packets (handle up to 10 missing packets)
+                                if gap > 0 && gap <= 10 {
+                                    // Perform PLC: repeat last frame with fade-out for missing packets
+                                    if let Some(ref last_frame) = last_decoded_frame {
+                                        for i in 0..(gap - 1) {
+                                            let fade_factor = 1.0 - (i as f32 / gap as f32);
+                                            if playback_prod.occupied_len() > 9600 {
+                                                dropped_frames += last_frame.len() as u64;
+                                                continue;
+                                            }
+                                            for &sample in last_frame.iter() {
+                                                let faded = sample * fade_factor;
+                                                if playback_prod.try_push(faded).is_err() {
+                                                    dropped_frames += 1;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // No previous frame, insert silence
+                                        for _ in 0..(gap - 1) {
+                                            for _ in 0..FRAME_SIZE {
+                                                if playback_prod.try_push(0.0).is_err() {
+                                                    dropped_frames += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            expected_sequence = Some(received_sequence.wrapping_add(1));
 
                             match decoder.decode(Some(opus_payload), &mut decoded_pcm, false) {
                                 Ok(samples_len) => {
@@ -820,9 +863,17 @@ async fn run_network(
                                         continue;
                                     }
 
-                                    for &s in &decoded_pcm[..samples_len] {
-                                        let s_f32 = s as f32 / 32768.0;
-                                        if playback_prod.try_push(s_f32).is_err() {
+                                    // Store decoded frame for PLC
+                                    let frame_f32: Vec<f32> = decoded_pcm[..samples_len]
+                                        .iter()
+                                        .map(|&s| s as f32 / 32768.0)
+                                        .collect();
+
+                                    // Update last frame for PLC
+                                    last_decoded_frame = Some(frame_f32.clone());
+
+                                    for &s in &frame_f32 {
+                                        if playback_prod.try_push(s).is_err() {
                                             dropped_frames += 1;
                                         }
                                     }
