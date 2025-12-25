@@ -57,6 +57,16 @@ cargo run
 *   **Network**: `webrtc-ice` for NAT traversal, `igd` for UPnP auto-mapping, `tokio` for async UDP
 *   **Interface**: `ratatui` text user interface
 
+## Technical Features
+
+*   **Adaptive Jitter Buffer**: Dynamically adjusts buffering (20-150ms) based on network conditions to balance latency and reliability. Monitors packet arrival patterns and adapts to maintain smooth audio even on unstable connections.
+
+*   **Packet Loss Concealment**: Detects missing packets and generates fade-out audio to mask gaps up to 200ms, preventing jarring dropouts during temporary packet loss.
+
+*   **Noise Gate**: Filters out background noise below a threshold (1% RMS), reducing bandwidth usage during silence and improving overall audio quality.
+
+*   **Sample Rate Adaptation**: Automatically resamples audio to 48kHz for optimal Opus encoding, regardless of device capabilities, ensuring consistent quality across different hardware.
+
 ## License
 
 MIT License
