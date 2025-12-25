@@ -1873,7 +1873,7 @@ mod tests {
     #[test]
     fn test_calculate_volume_with_full_scale_sine() {
         // Full scale sine wave (amplitude 1.0) has RMS = 1/sqrt(2) ≈ 0.707
-        // After multiplying by 5.0 and clamping: 0.707 * 5.0 = 3.535, clamped to 1.0
+        // After multiplying by VOLUME_NORMALIZATION_FACTOR and clamping: 0.707 * 5.0 = 3.535, clamped to 1.0
         let samples = generate_sine_wave(960, 440.0, 1.0, SAMPLE_RATE);
         let volume = calculate_volume(&samples);
         assert!(
@@ -1891,7 +1891,7 @@ mod tests {
     #[test]
     fn test_calculate_volume_with_small_amplitude() {
         // Small amplitude signal (RMS ≈ 0.01 * 0.707 ≈ 0.007)
-        // After multiplying by 5.0: 0.007 * 5.0 ≈ 0.035
+        // After multiplying by VOLUME_NORMALIZATION_FACTOR: 0.007 * 5.0 ≈ 0.035
         let samples = generate_sine_wave(960, 440.0, 0.01, SAMPLE_RATE);
         let volume = calculate_volume(&samples);
         assert!(
@@ -1908,10 +1908,10 @@ mod tests {
     #[test]
     fn test_calculate_volume_with_noise_gate_threshold() {
         // Test signal exactly at noise gate threshold (RMS = 0.01)
-        // After calculate_volume: RMS * 5.0 = 0.01 * 5.0 = 0.05
+        // After calculate_volume: RMS * VOLUME_NORMALIZATION_FACTOR = 0.01 * 5.0 = 0.05
         let samples = generate_white_noise(960, NOISE_GATE_THRESHOLD);
         let volume = calculate_volume(&samples);
-        let expected = (NOISE_GATE_THRESHOLD * 5.0).clamp(0.0, 1.0);
+        let expected = (NOISE_GATE_THRESHOLD * VOLUME_NORMALIZATION_FACTOR).clamp(0.0, 1.0);
         assert!(
             (volume - expected).abs() < 0.01,
             "Volume at noise gate threshold should be approximately {} (got {})",
@@ -2048,12 +2048,13 @@ mod tests {
             "Should record normal interval"
         );
 
-        // Third packet with huge gap (> 500ms) - should be ignored
+        // Third packet with huge gap (> INTER_ARRIVAL_OUTLIER_THRESHOLD_MS) - should be ignored
         buffer.record_packet_arrival(base_time + Duration::from_secs(1));
         assert_eq!(
             buffer.inter_arrival_times.len(),
             1,
-            "Should ignore outlier interval (> 500ms)"
+            "Should ignore outlier interval (> {}ms)",
+            INTER_ARRIVAL_OUTLIER_THRESHOLD_MS
         );
 
         // Fourth packet with negative interval (should be ignored via > 0.0 check)
@@ -2065,15 +2066,16 @@ mod tests {
         let mut buffer = AdaptiveJitterBuffer::new();
         let base_time = Instant::now();
 
-        // Record more than 10 packets (capacity limit)
+        // Record more than JITTER_BUFFER_INTER_ARRIVAL_HISTORY_SIZE packets (capacity limit)
         for i in 0..15 {
             let time = base_time + Duration::from_millis(i * 20);
             buffer.record_packet_arrival(time);
         }
 
         assert!(
-            buffer.inter_arrival_times.len() <= 10,
-            "Should limit history to 10 intervals (got {})",
+            buffer.inter_arrival_times.len() <= JITTER_BUFFER_INTER_ARRIVAL_HISTORY_SIZE,
+            "Should limit history to {} intervals (got {})",
+            JITTER_BUFFER_INTER_ARRIVAL_HISTORY_SIZE,
             buffer.inter_arrival_times.len()
         );
     }
@@ -2200,7 +2202,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
 
         // Simulate condition that would want to change to 100ms
-        // With 10% adjustment factor, change should be gradual
+        // With JITTER_BUFFER_ADJUSTMENT_FACTOR adjustment, change should be gradual
         buffer.target_buffer_ms = 50.0;
         // Use a very low buffer value (but not negative) to trigger underrun adjustment
         let very_low_buffer = BUFFER_UNDERRUN_THRESHOLD_SAMPLES.saturating_sub(500);
@@ -2211,7 +2213,7 @@ mod tests {
         // Should move toward higher value but not instantly
         assert!(new_target > 50.0, "Should increase toward higher target");
         assert!(
-            new_target < 150.0,
+            new_target < MAX_BUFFER_MS,
             "Should not jump instantly (smoothing should apply)"
         );
     }
@@ -2468,7 +2470,7 @@ mod tests {
 
     #[test]
     fn test_plc_fade_factor_decreases_gradually() {
-        let gap = 10u32;
+        let gap = MAX_PACKET_GAP_FOR_PLC;
         let mut prev_factor = 1.0;
         for i in 0..(gap - 1) {
             let fade_factor = 1.0 - (i as f32 / gap as f32);
