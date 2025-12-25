@@ -117,6 +117,7 @@ enum AppAction {
     StartConnection(Arc<dyn webrtc_util::Conn + Send + Sync>),
     SetMicVolume(f32),
     SetReceiveVolume(f32),
+    SetLatency(f32),
     SetConnectionType(String),
     ToggleMute,
 }
@@ -146,6 +147,7 @@ struct App {
     host_agent_handle: Option<IceAgentHandle>,
     mic_volume: f32,
     receive_volume: f32,
+    current_latency_ms: f32,
     connection_type: String,
     is_muted: bool,
 }
@@ -167,6 +169,7 @@ impl App {
             host_agent_handle: None,
             mic_volume: 0.0,
             receive_volume: 0.0,
+            current_latency_ms: 0.0,
             connection_type: "Unknown".into(),
             is_muted: false,
         }
@@ -663,6 +666,9 @@ async fn capture_processor(
     let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_size);
     let mut opus_buf = vec![0u8; 1024];
 
+    // Pre-allocated scratch buffer for zero-allocation frame processing
+    let mut frame_scratch: Vec<f32> = vec![0.0; frame_size];
+
     // Resampler setup
     let mut resampler: Option<SincFixedIn<f32>> = if sample_rate != 48000 {
         let params = rubato::SincInterpolationParameters {
@@ -754,11 +760,17 @@ async fn capture_processor(
 
         // 3. Process F32 buffer into Opus Frames
         while f32_capture_buffer.len() >= frame_size {
-            // Take exactly frame_size
-            let frame_samples: Vec<f32> = f32_capture_buffer.drain(0..frame_size).collect();
+            // Copy frame_size samples to scratch buffer (zero-allocation)
+            frame_scratch[..frame_size].copy_from_slice(&f32_capture_buffer[..frame_size]);
+            f32_capture_buffer.drain(0..frame_size);
 
             // Calculate RMS (Root Mean Square) for noise gate
-            let rms = (frame_samples.iter().map(|s| s * s).sum::<f32>() / frame_size as f32).sqrt();
+            let rms = (frame_scratch[..frame_size]
+                .iter()
+                .map(|s| s * s)
+                .sum::<f32>()
+                / frame_size as f32)
+                .sqrt();
 
             // Noise gate: skip encoding if below threshold
             if rms < NOISE_GATE_THRESHOLD {
@@ -778,7 +790,7 @@ async fn capture_processor(
             }
 
             // Calc volume & Convert to i16
-            for sample in frame_samples {
+            for sample in &frame_scratch[..frame_size] {
                 vol_sum += sample.abs();
                 vol_count += 1;
 
@@ -1125,6 +1137,10 @@ async fn run_network(
                                     let current_buffer_level = playback_prod.occupied_len();
                                     jitter_buffer.adjust_for_conditions(current_buffer_level, &action_tx);
 
+                                    // Calculate and report current latency (buffer level in ms)
+                                    let current_latency_ms = (current_buffer_level as f32 / SAMPLE_RATE as f32) * 1000.0;
+                                    try_send_action(&action_tx, AppAction::SetLatency(current_latency_ms), &mut dropped_ui_messages, &mut last_ui_drop_log);
+
                                     // Buffer overflow protection (drop if way too full)
                                     if playback_prod.occupied_len() > BUFFER_SIZE * 3 / 4 {
                                         dropped_frames += samples_len as u64;
@@ -1258,7 +1274,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .constraints([Constraint::Min(3), Constraint::Length(4)])
             .split(chunks[1]);
 
         let logs: Vec<ListItem> = app
@@ -1274,13 +1290,38 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             inner_chunks[0],
         );
 
-        // Show both volume meters side by side
+        // Show volume meters and latency gauge
         let gauge_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(3)])
+            .split(inner_chunks[1]);
+
+        // Volume meters side by side
+        let volume_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(inner_chunks[1]);
-        f.render_widget(mic_gauge, gauge_chunks[0]);
-        f.render_widget(receive_gauge, gauge_chunks[1]);
+            .split(gauge_chunks[0]);
+        f.render_widget(mic_gauge, volume_chunks[0]);
+        f.render_widget(receive_gauge, volume_chunks[1]);
+
+        // Latency gauge
+        let latency_ratio = (app.current_latency_ms / MAX_BUFFER_MS).clamp(0.0, 1.0) as f64;
+        let latency_color = if app.current_latency_ms < MIN_BUFFER_MS {
+            Color::Green
+        } else if app.current_latency_ms > MAX_BUFFER_MS * 0.8 {
+            Color::Yellow
+        } else {
+            Color::Cyan
+        };
+        let latency_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!("Current Latency: {:.0}ms", app.current_latency_ms))
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(latency_color))
+            .ratio(latency_ratio);
+        f.render_widget(latency_gauge, gauge_chunks[1]);
     } else {
         let logs: Vec<ListItem> = app
             .logs
@@ -1390,6 +1431,9 @@ async fn main() -> Result<()> {
                 }
                 AppAction::SetReceiveVolume(vol) => {
                     app.receive_volume = vol;
+                }
+                AppAction::SetLatency(latency_ms) => {
+                    app.current_latency_ms = latency_ms;
                 }
                 AppAction::SetConnectionType(conn_type) => {
                     app.connection_type = conn_type;

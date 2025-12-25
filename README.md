@@ -48,7 +48,7 @@ cargo run
 2.  **Client**: Press **C**. Paste the Session Offer (using your terminal's paste: right-click, Ctrl+V, or Ctrl+Shift+V) in the input field, then press **Enter**. Press **Y** to copy the generated Session Answer to your clipboard, then paste it to send back to the host.
 3.  **Host**: Paste the Session Answer.
 4.  Connection establishes automatically.
-5.  **During Call**: Press **M** to toggle microphone mute. The status bar and volume gauge will reflect the mute state.
+5.  **During Call**: Press **M** to toggle microphone mute. The status bar, volume gauges, and latency display will reflect the current call state.
 
 ## Architecture
 
