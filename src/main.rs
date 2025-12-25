@@ -875,6 +875,12 @@ impl AdaptiveJitterBuffer {
     }
 }
 
+// Helper function to calculate normalized volume from PCM samples
+fn calculate_volume(samples: &[f32]) -> f32 {
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    (rms * 5.0).clamp(0.0, 1.0)
+}
+
 async fn run_network(
     conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
     mut network_rx: mpsc::Receiver<Vec<u8>>,
@@ -947,36 +953,46 @@ async fn run_network(
                             // Packet Loss Concealment: detect missing packets
                             if let Some(expected) = expected_sequence {
                                 let gap = received_sequence.wrapping_sub(expected);
-                                // If gap > 0, we have missing packets (handle up to 10 missing packets)
-                                if gap > 0 && gap <= 10 {
-                                    // Perform PLC: repeat last frame with fade-out for missing packets
-                                    if let Some(ref last_frame) = last_decoded_frame {
-                                        for i in 0..(gap - 1) {
-                                            let fade_factor = 1.0 - (i as f32 / gap as f32);
-                                            if playback_prod.occupied_len() > BUFFER_SIZE * 3 / 4 {
-                                                dropped_frames += last_frame.len() as u64;
-                                                continue;
-                                            }
-                                            // Calculate volume for PLC frames (faded)
-                                            let mut plc_vol_sum = 0.0;
-                                            for &sample in last_frame.iter() {
-                                                let faded = sample * fade_factor;
-                                                plc_vol_sum += faded.abs();
-                                                if playback_prod.try_push(faded).is_err() {
-                                                    dropped_frames += 1;
+                                if gap > 0 {
+                                    if gap > 10 {
+                                        // Log significant packet loss (200ms+)
+                                        let _ = action_tx.try_send(AppAction::Log(format!(
+                                            "Warning: Large packet gap detected ({} packets, {}ms+)",
+                                            gap,
+                                            gap * FRAME_DURATION_MS
+                                        )));
+                                    }
+                                    // Handle gaps up to 10 packets (200ms)
+                                    if gap <= 10 {
+                                        // Perform PLC: repeat last frame with fade-out for missing packets
+                                        if let Some(ref last_frame) = last_decoded_frame {
+                                            for i in 0..(gap - 1) {
+                                                let fade_factor = 1.0 - (i as f32 / gap as f32);
+                                                // Generate faded frame
+                                                let faded_frame: Vec<f32> = last_frame
+                                                    .iter()
+                                                    .map(|&s| s * fade_factor)
+                                                    .collect();
+
+                                                // Update receive volume for PLC frames
+                                                let plc_vol = calculate_volume(&faded_frame);
+                                                let _ = action_tx.try_send(AppAction::SetReceiveVolume(plc_vol));
+
+                                                // Push faded samples (buffer overflow check happens after decode)
+                                                for &sample in &faded_frame {
+                                                    if playback_prod.try_push(sample).is_err() {
+                                                        dropped_frames += 1;
+                                                    }
                                                 }
                                             }
-                                            // Update receive volume for PLC frames
-                                            let plc_vol = (plc_vol_sum / last_frame.len() as f32 * 5.0).clamp(0.0, 1.0);
-                                            let _ = action_tx.try_send(AppAction::SetReceiveVolume(plc_vol));
-                                        }
-                                    } else {
-                                        // No previous frame, insert silence (zero volume)
-                                        let _ = action_tx.try_send(AppAction::SetReceiveVolume(0.0));
-                                        for _ in 0..(gap - 1) {
-                                            for _ in 0..FRAME_SIZE {
-                                                if playback_prod.try_push(0.0).is_err() {
-                                                    dropped_frames += 1;
+                                        } else {
+                                            // No previous frame, insert silence (zero volume)
+                                            let _ = action_tx.try_send(AppAction::SetReceiveVolume(0.0));
+                                            for _ in 0..(gap - 1) {
+                                                for _ in 0..FRAME_SIZE {
+                                                    if playback_prod.try_push(0.0).is_err() {
+                                                        dropped_frames += 1;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1025,9 +1041,8 @@ async fn run_network(
                                         .map(|&s| s as f32 / 32768.0)
                                         .collect();
 
-                                    // Calculate receive volume (RMS)
-                                    let receive_rms = (frame_f32.iter().map(|s| s * s).sum::<f32>() / frame_f32.len() as f32).sqrt();
-                                    let receive_vol_normalized = (receive_rms * 5.0).clamp(0.0, 1.0);
+                                    // Calculate receive volume
+                                    let receive_vol_normalized = calculate_volume(&frame_f32);
                                     let _ = action_tx.try_send(AppAction::SetReceiveVolume(receive_vol_normalized));
 
                                     // Update last frame for PLC
