@@ -14,6 +14,16 @@ Peer to peer voice chat tool written in Rust using a terminal interface. Facilit
 cargo build --release
 ```
 
+## Testing
+
+Run the test suite:
+
+```bash
+cargo test
+```
+
+The test suite includes comprehensive coverage of audio processing, jitter buffer management, packet loss concealment, and session serialization.
+
 ## Usage
 
 Start the application:
