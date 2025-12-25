@@ -46,6 +46,14 @@ const BUFFER_SIZE: usize = 19200;
 // Value is in normalized range [0.0, 1.0] where 1.0 is full scale
 const NOISE_GATE_THRESHOLD: f32 = 0.01; // ~1% of full scale, adjustable
 
+// Adaptive jitter buffer configuration
+const MIN_BUFFER_MS: f32 = 20.0; // Minimum buffer size (20ms for low latency)
+const MAX_BUFFER_MS: f32 = 150.0; // Maximum buffer size (150ms for high jitter)
+const INITIAL_BUFFER_MS: f32 = 40.0; // Initial buffer size (start conservative, lower than old 60ms for better latency)
+const JITTER_ADJUSTMENT_THRESHOLD_MS: f32 = 5.0; // Adjust if jitter exceeds this
+const BUFFER_UNDERRUN_THRESHOLD_SAMPLES: usize = FRAME_SIZE; // Trigger increase if below this
+const BUFFER_OVERRUN_THRESHOLD_SAMPLES: usize = BUFFER_SIZE / 2; // Trigger decrease if above this
+
 #[derive(Clone, Debug, PartialEq)]
 enum AppMode {
     Menu,
@@ -756,6 +764,117 @@ async fn capture_processor(
     }
 }
 
+// Adaptive jitter buffer state
+struct AdaptiveJitterBuffer {
+    target_buffer_ms: f32, // Current target buffer size in milliseconds
+    last_packet_time: Option<std::time::Instant>, // Last packet arrival time
+    inter_arrival_times: VecDeque<f32>, // Recent inter-arrival times (ms) for jitter calculation
+    adjustment_log_countdown: u32, // Countdown to log buffer adjustments
+}
+
+impl AdaptiveJitterBuffer {
+    fn new() -> Self {
+        Self {
+            target_buffer_ms: INITIAL_BUFFER_MS,
+            last_packet_time: None,
+            inter_arrival_times: VecDeque::with_capacity(10), // Keep last 10 intervals
+            adjustment_log_countdown: 0,
+        }
+    }
+
+    fn calculate_jitter_ms(&self) -> f32 {
+        if self.inter_arrival_times.len() < 3 {
+            return 0.0; // Not enough data yet
+        }
+
+        // Calculate mean inter-arrival time
+        let mean: f32 =
+            self.inter_arrival_times.iter().sum::<f32>() / self.inter_arrival_times.len() as f32;
+
+        // Calculate variance (jitter)
+        let variance: f32 = self
+            .inter_arrival_times
+            .iter()
+            .map(|&t| (t - mean).powi(2))
+            .sum::<f32>()
+            / self.inter_arrival_times.len() as f32;
+
+        variance.sqrt() // Standard deviation is our jitter metric
+    }
+
+    fn record_packet_arrival(&mut self, now: std::time::Instant) {
+        if let Some(last_time) = self.last_packet_time {
+            let interval_ms = now.duration_since(last_time).as_secs_f32() * 1000.0;
+            if interval_ms > 0.0 && interval_ms < 500.0 {
+                // Sanity check: ignore outliers
+                self.inter_arrival_times.push_back(interval_ms);
+                if self.inter_arrival_times.len() > 10 {
+                    self.inter_arrival_times.pop_front();
+                }
+            }
+        }
+        self.last_packet_time = Some(now);
+    }
+
+    fn adjust_for_conditions(
+        &mut self,
+        current_buffer_samples: usize,
+        action_tx: &mpsc::Sender<AppAction>,
+    ) {
+        let current_buffer_ms = (current_buffer_samples as f32 / SAMPLE_RATE as f32) * 1000.0;
+        let jitter_ms = self.calculate_jitter_ms();
+        let mut new_target = self.target_buffer_ms;
+
+        // Adjust based on measured jitter
+        if jitter_ms > JITTER_ADJUSTMENT_THRESHOLD_MS {
+            // Increase buffer to accommodate jitter (target: 3x jitter + base)
+            new_target = (jitter_ms * 3.0 + MIN_BUFFER_MS).min(MAX_BUFFER_MS);
+        } else if jitter_ms < JITTER_ADJUSTMENT_THRESHOLD_MS * 0.5
+            && current_buffer_ms > self.target_buffer_ms * 1.5
+        {
+            // Low jitter and buffer is too full - reduce target for lower latency
+            new_target = (self.target_buffer_ms * 0.95).max(MIN_BUFFER_MS);
+        }
+
+        // Adjust based on buffer level (prevent underruns/overflows)
+        if current_buffer_samples < BUFFER_UNDERRUN_THRESHOLD_SAMPLES {
+            // Buffer is getting too low - increase target
+            new_target = (self.target_buffer_ms * 1.1).min(MAX_BUFFER_MS);
+        } else if current_buffer_samples > BUFFER_OVERRUN_THRESHOLD_SAMPLES {
+            // Buffer is getting too full - decrease target (but not below jitter requirement)
+            let min_for_jitter = (jitter_ms * 3.0 + MIN_BUFFER_MS).min(MAX_BUFFER_MS);
+            new_target = (self.target_buffer_ms * 0.95).max(min_for_jitter.max(MIN_BUFFER_MS));
+        }
+
+        // Apply exponential smoothing to avoid rapid oscillations (10% change per adjustment)
+        let adjustment_factor = 0.1;
+        new_target =
+            self.target_buffer_ms + (new_target - self.target_buffer_ms) * adjustment_factor;
+        new_target = new_target.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
+
+        // Only log significant changes
+        if (new_target - self.target_buffer_ms).abs() > 5.0 {
+            self.adjustment_log_countdown = 30; // Log every 30 adjustments max
+            if self.adjustment_log_countdown == 30 {
+                let _ = action_tx.try_send(AppAction::Log(format!(
+                    "Jitter buffer: {:.0}ms -> {:.0}ms (jitter: {:.1}ms)",
+                    self.target_buffer_ms, new_target, jitter_ms
+                )));
+            }
+        }
+
+        if self.adjustment_log_countdown > 0 {
+            self.adjustment_log_countdown -= 1;
+        }
+
+        self.target_buffer_ms = new_target;
+    }
+
+    fn get_target_buffer_samples(&self) -> usize {
+        (self.target_buffer_ms / 1000.0 * SAMPLE_RATE as f32) as usize
+    }
+}
+
 async fn run_network(
     conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
     mut network_rx: mpsc::Receiver<Vec<u8>>,
@@ -765,7 +884,8 @@ async fn run_network(
     _sample_rate: u32,
 ) {
     let mut buf = vec![0u8; 8192];
-    let mut buffering = true;
+    let mut jitter_buffer = AdaptiveJitterBuffer::new();
+    let mut initial_buffering = true;
 
     // Opus Decoder
     let mut decoder = match OpusDecoder::new(OpusSampleRate::Hz48000, OpusChannels::Mono) {
@@ -833,7 +953,7 @@ async fn run_network(
                                     if let Some(ref last_frame) = last_decoded_frame {
                                         for i in 0..(gap - 1) {
                                             let fade_factor = 1.0 - (i as f32 / gap as f32);
-                                            if playback_prod.occupied_len() > 9600 {
+                                            if playback_prod.occupied_len() > BUFFER_SIZE * 3 / 4 {
                                                 dropped_frames += last_frame.len() as u64;
                                                 continue;
                                             }
@@ -867,18 +987,34 @@ async fn run_network(
 
                             match decoder.decode(Some(opus_payload), &mut decoded_pcm, false) {
                                 Ok(samples_len) => {
-                                    // Initialize jitter buffer logic (60ms pre-fill)
-                                    if buffering {
-                                        let jitter_samples = FRAME_SIZE * 3;
-                                        for _ in 0..jitter_samples {
-                                            let _ = playback_prod.try_push(0.0);
+                                    // Record packet arrival for jitter calculation
+                                    let now = std::time::Instant::now();
+                                    jitter_buffer.record_packet_arrival(now);
+
+                                    // Initial buffering: fill to target buffer size
+                                    if initial_buffering {
+                                        let target_samples = jitter_buffer.get_target_buffer_samples();
+                                        let current_fill = playback_prod.occupied_len();
+                                        if current_fill < target_samples {
+                                            // Fill remaining buffer with silence
+                                            let silence_needed = target_samples - current_fill;
+                                            for _ in 0..silence_needed {
+                                                let _ = playback_prod.try_push(0.0);
+                                            }
+                                            let _ = action_tx.send(AppAction::Log(format!(
+                                                "Jitter buffer primed ({}ms)",
+                                                jitter_buffer.target_buffer_ms as u32
+                                            ))).await;
                                         }
-                                        buffering = false;
-                                        let _ = action_tx.send(AppAction::Log("Jitter buffer primed (60ms)".into())).await;
+                                        initial_buffering = false;
                                     }
 
-                                    // Basic buffer overflow protection
-                                    if playback_prod.occupied_len() > 9600 {
+                                    // Adaptive buffer adjustment
+                                    let current_buffer_level = playback_prod.occupied_len();
+                                    jitter_buffer.adjust_for_conditions(current_buffer_level, &action_tx);
+
+                                    // Buffer overflow protection (drop if way too full)
+                                    if playback_prod.occupied_len() > BUFFER_SIZE * 3 / 4 {
                                         dropped_frames += samples_len as u64;
                                         continue;
                                     }
