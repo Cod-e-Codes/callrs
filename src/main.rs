@@ -1465,17 +1465,33 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
     let (display_text, title) = match &app.mode {
         AppMode::HostWaitingForAnswer { offer } => {
-            // Display original string - wrapping will handle display, copying will get clean text
+            // Show offer at top, input field below for answer
+            // Use a separator to make it clear where to paste
+            let answer_section = if app.input.is_empty() {
+                "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n[Paste answer below and press Enter]\n".to_string()
+            } else if app.input.len() > 300 {
+                format!(
+                    "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nAnswer ({} chars): {}...\n",
+                    app.input.len(),
+                    &app.input[..300]
+                )
+            } else {
+                format!(
+                    "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nAnswer ({} chars): {}\n",
+                    app.input.len(),
+                    app.input
+                )
+            };
             (
-                offer.clone(),
-                "Your Offer (send to client) | Paste Answer Below:",
+                format!("{}\n{}", offer, answer_section),
+                "Your Offer (send to client) | Paste Answer Below".to_string(),
             )
         }
         AppMode::ClientGeneratingAnswer { answer } => {
-            (answer.clone(), "Your Answer (send to host)")
+            (answer.clone(), "Your Answer (send to host)".to_string())
         }
-        AppMode::Error(msg) => (msg.clone(), "Error (press ESC to dismiss)"),
-        _ => (app.input.clone(), "Input / Session Data"),
+        AppMode::Error(msg) => (msg.clone(), "Error (press ESC to dismiss)".to_string()),
+        _ => (app.input.clone(), "Input / Session Data".to_string()),
     };
 
     f.render_widget(
@@ -1502,6 +1518,15 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Setup panic hook to ensure terminal is restored on panic
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Best effort terminal cleanup
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+
     enable_raw_mode()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -1540,7 +1565,12 @@ async fn main() -> Result<()> {
                         app.mode,
                         AppMode::Connecting | AppMode::HostWaitingForAnswer { .. }
                     ) {
-                        app.input.push_str(&text);
+                        // Sanitize paste: remove any control characters that might cause issues
+                        let sanitized: String = text
+                            .chars()
+                            .filter(|c| !c.is_control() || *c == '\n' || *c == '\r')
+                            .collect();
+                        app.input.push_str(&sanitized);
                     }
                 }
                 AppAction::SetOffer(offer) => {
@@ -1706,7 +1736,18 @@ async fn main() -> Result<()> {
                             if !app.input.is_empty()
                                 && let Some(agent_handle) = app.host_agent_handle.take()
                             {
-                                let answer_b64 = app.input.clone();
+                                // Trim whitespace and newlines from input (paste might include them)
+                                let answer_b64 = app.input.trim().to_string();
+
+                                // Validate it looks like base64 before proceeding
+                                if answer_b64.is_empty() {
+                                    app.add_log(
+                                        "Error: Empty input. Please paste the answer.".into(),
+                                    );
+                                    app.host_agent_handle = Some(agent_handle);
+                                    continue;
+                                }
+
                                 let tx = action_tx.clone();
 
                                 app.mode = AppMode::IceConnecting;
