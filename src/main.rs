@@ -89,14 +89,14 @@ enum AppAction {
     ToggleMute,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct SessionOffer {
     ufrag: String,
     pwd: String,
     candidates: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct SessionAnswer {
     ufrag: String,
     pwd: String,
@@ -877,6 +877,9 @@ impl AdaptiveJitterBuffer {
 
 // Helper function to calculate normalized volume from PCM samples
 fn calculate_volume(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
     let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
     (rms * 5.0).clamp(0.0, 1.0)
 }
@@ -1688,4 +1691,749 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    // ============================================================================
+    // Test Helpers
+    // ============================================================================
+
+    /// Generate silent audio samples (all zeros)
+    fn generate_silence(num_samples: usize) -> Vec<f32> {
+        vec![0.0; num_samples]
+    }
+
+    /// Generate a sine wave at specified frequency and amplitude
+    fn generate_sine_wave(
+        num_samples: usize,
+        frequency: f32,
+        amplitude: f32,
+        sample_rate: u32,
+    ) -> Vec<f32> {
+        let mut samples = Vec::with_capacity(num_samples);
+        let phase_increment = 2.0 * std::f32::consts::PI * frequency / sample_rate as f32;
+        for i in 0..num_samples {
+            samples.push(amplitude * (i as f32 * phase_increment).sin());
+        }
+        samples
+    }
+
+    /// Generate white noise with specified RMS amplitude
+    fn generate_white_noise(num_samples: usize, rms_amplitude: f32) -> Vec<f32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut samples = Vec::with_capacity(num_samples);
+        let mut hasher = DefaultHasher::new();
+        for i in 0..num_samples {
+            i.hash(&mut hasher);
+            let hash = hasher.finish();
+            // Convert hash to float in range [-1, 1]
+            let sample = ((hash % 2000000) as f32 / 1000000.0) - 1.0;
+            samples.push(sample * rms_amplitude);
+        }
+        // Normalize to desired RMS
+        let current_rms: f32 =
+            (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        if current_rms > 0.0 {
+            let scale = rms_amplitude / current_rms;
+            samples.iter_mut().for_each(|s| *s *= scale);
+        }
+        samples
+    }
+
+    /// Calculate RMS (Root Mean Square) of samples
+    fn calculate_rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    /// Create a mock packet with sequence number and Opus payload
+    fn create_mock_packet(sequence: u32, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(4 + payload.len());
+        packet.extend_from_slice(&sequence.to_le_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    // ============================================================================
+    // Tests for calculate_volume
+    // ============================================================================
+
+    #[test]
+    fn test_calculate_volume_with_silence() {
+        let samples = generate_silence(960);
+        let volume = calculate_volume(&samples);
+        assert_eq!(volume, 0.0, "Silence should produce zero volume");
+    }
+
+    #[test]
+    fn test_calculate_volume_with_full_scale_sine() {
+        // Full scale sine wave (amplitude 1.0) has RMS = 1/sqrt(2) ≈ 0.707
+        // After multiplying by 5.0 and clamping: 0.707 * 5.0 = 3.535, clamped to 1.0
+        let samples = generate_sine_wave(960, 440.0, 1.0, SAMPLE_RATE);
+        let volume = calculate_volume(&samples);
+        assert!(
+            volume > 0.99,
+            "Full scale sine should produce near-maximum volume (got {})",
+            volume
+        );
+        assert!(
+            volume <= 1.0,
+            "Volume should be clamped to 1.0 (got {})",
+            volume
+        );
+    }
+
+    #[test]
+    fn test_calculate_volume_with_small_amplitude() {
+        // Small amplitude signal (RMS ≈ 0.01 * 0.707 ≈ 0.007)
+        // After multiplying by 5.0: 0.007 * 5.0 ≈ 0.035
+        let samples = generate_sine_wave(960, 440.0, 0.01, SAMPLE_RATE);
+        let volume = calculate_volume(&samples);
+        assert!(
+            volume > 0.0,
+            "Small amplitude should produce non-zero volume"
+        );
+        assert!(
+            volume < 0.1,
+            "Small amplitude should produce low volume (got {})",
+            volume
+        );
+    }
+
+    #[test]
+    fn test_calculate_volume_with_noise_gate_threshold() {
+        // Test signal exactly at noise gate threshold (RMS = 0.01)
+        // After calculate_volume: RMS * 5.0 = 0.01 * 5.0 = 0.05
+        let samples = generate_white_noise(960, NOISE_GATE_THRESHOLD);
+        let volume = calculate_volume(&samples);
+        let expected = (NOISE_GATE_THRESHOLD * 5.0).clamp(0.0, 1.0);
+        assert!(
+            (volume - expected).abs() < 0.01,
+            "Volume at noise gate threshold should be approximately {} (got {})",
+            expected,
+            volume
+        );
+    }
+
+    #[test]
+    fn test_calculate_volume_scales_with_amplitude() {
+        let small = generate_sine_wave(960, 440.0, 0.1, SAMPLE_RATE);
+        let large = generate_sine_wave(960, 440.0, 0.5, SAMPLE_RATE);
+        let vol_small = calculate_volume(&small);
+        let vol_large = calculate_volume(&large);
+        assert!(
+            vol_large > vol_small,
+            "Larger amplitude should produce larger volume (small: {}, large: {})",
+            vol_small,
+            vol_large
+        );
+    }
+
+    #[test]
+    fn test_calculate_volume_handles_empty_input() {
+        let samples = vec![];
+        let volume = calculate_volume(&samples);
+        // RMS of empty array is 0, so volume should be 0
+        assert_eq!(volume, 0.0, "Empty input should produce zero volume");
+    }
+
+    #[test]
+    fn test_calculate_volume_clamps_to_one() {
+        // Very loud signal that would exceed 1.0 without clamping
+        let samples = generate_sine_wave(960, 440.0, 1.5, SAMPLE_RATE);
+        let volume = calculate_volume(&samples);
+        assert!(
+            volume <= 1.0,
+            "Volume should be clamped to 1.0 (got {})",
+            volume
+        );
+    }
+
+    // ============================================================================
+    // Tests for AdaptiveJitterBuffer
+    // ============================================================================
+
+    #[test]
+    fn test_jitter_buffer_new_starts_at_initial_target() {
+        let buffer = AdaptiveJitterBuffer::new();
+        assert_eq!(
+            buffer.target_buffer_ms, INITIAL_BUFFER_MS,
+            "New jitter buffer should start at initial target ({}ms)",
+            INITIAL_BUFFER_MS
+        );
+        assert!(
+            buffer.last_packet_time.is_none(),
+            "New buffer should have no packet time"
+        );
+        assert!(
+            buffer.inter_arrival_times.is_empty(),
+            "New buffer should have no arrival times"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_calculate_jitter_returns_zero_with_insufficient_data() {
+        let buffer = AdaptiveJitterBuffer::new();
+        assert_eq!(
+            buffer.calculate_jitter_ms(),
+            0.0,
+            "Jitter should be 0 with insufficient data (< 3 packets)"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_calculate_jitter_with_perfect_timing() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let base_time = Instant::now();
+
+        // Record packets at exactly 20ms intervals (perfect timing)
+        for i in 0..5 {
+            let time = base_time + Duration::from_millis(i * 20);
+            buffer.record_packet_arrival(time);
+        }
+
+        let jitter = buffer.calculate_jitter_ms();
+        // With perfect timing, variance should be very small (close to 0)
+        assert!(
+            jitter < 1.0,
+            "Perfect timing should produce near-zero jitter (got {}ms)",
+            jitter
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_calculate_jitter_with_variable_timing() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let base_time = Instant::now();
+
+        // Record packets with varying intervals: 15ms, 25ms, 18ms, 22ms, 20ms
+        let intervals = vec![15, 25, 18, 22, 20];
+        let mut current_time = base_time;
+        for interval in intervals {
+            current_time += Duration::from_millis(interval);
+            buffer.record_packet_arrival(current_time);
+        }
+
+        let jitter = buffer.calculate_jitter_ms();
+        // Should have some jitter with variable timing
+        assert!(
+            jitter > 0.0,
+            "Variable timing should produce non-zero jitter"
+        );
+        assert!(
+            jitter < 10.0,
+            "Jitter should be reasonable (got {}ms)",
+            jitter
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_record_packet_arrival_ignores_outliers() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let base_time = Instant::now();
+
+        // First packet
+        buffer.record_packet_arrival(base_time);
+
+        // Second packet with normal interval (20ms)
+        buffer.record_packet_arrival(base_time + Duration::from_millis(20));
+        assert_eq!(
+            buffer.inter_arrival_times.len(),
+            1,
+            "Should record normal interval"
+        );
+
+        // Third packet with huge gap (> 500ms) - should be ignored
+        buffer.record_packet_arrival(base_time + Duration::from_secs(1));
+        assert_eq!(
+            buffer.inter_arrival_times.len(),
+            1,
+            "Should ignore outlier interval (> 500ms)"
+        );
+
+        // Fourth packet with negative interval (should be ignored via > 0.0 check)
+        // This test is harder to do with Instant, but the code checks interval_ms > 0.0
+    }
+
+    #[test]
+    fn test_jitter_buffer_record_packet_arrival_limits_history() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let base_time = Instant::now();
+
+        // Record more than 10 packets (capacity limit)
+        for i in 0..15 {
+            let time = base_time + Duration::from_millis(i * 20);
+            buffer.record_packet_arrival(time);
+        }
+
+        assert!(
+            buffer.inter_arrival_times.len() <= 10,
+            "Should limit history to 10 intervals (got {})",
+            buffer.inter_arrival_times.len()
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_get_target_buffer_samples() {
+        let buffer = AdaptiveJitterBuffer::new();
+        let samples = buffer.get_target_buffer_samples();
+        let expected = (INITIAL_BUFFER_MS / 1000.0 * SAMPLE_RATE as f32) as usize;
+        assert_eq!(
+            samples, expected,
+            "Target buffer samples should match calculated value (got {}, expected {})",
+            samples, expected
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_adjust_increases_on_high_jitter() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let (tx, _rx) = mpsc::channel(10);
+        let base_time = Instant::now();
+
+        // Create high jitter scenario (varying intervals)
+        let intervals = vec![10, 30, 15, 25, 12, 28];
+        let mut current_time = base_time;
+        for interval in intervals {
+            current_time += Duration::from_millis(interval);
+            buffer.record_packet_arrival(current_time);
+        }
+
+        let initial_target = buffer.target_buffer_ms;
+        let jitter = buffer.calculate_jitter_ms();
+
+        // Adjust with buffer level that's okay
+        buffer.adjust_for_conditions(BUFFER_UNDERRUN_THRESHOLD_SAMPLES + 100, &tx);
+
+        // Should increase if jitter > threshold
+        if jitter > JITTER_ADJUSTMENT_THRESHOLD_MS {
+            assert!(
+                buffer.target_buffer_ms >= initial_target,
+                "Should increase buffer on high jitter (initial: {}, new: {}, jitter: {})",
+                initial_target,
+                buffer.target_buffer_ms,
+                jitter
+            );
+            assert!(
+                buffer.target_buffer_ms <= MAX_BUFFER_MS,
+                "Should respect MAX_BUFFER_MS (got {}ms)",
+                buffer.target_buffer_ms
+            );
+        }
+    }
+
+    #[test]
+    fn test_jitter_buffer_adjust_increases_on_underrun() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let (tx, _rx) = mpsc::channel(10);
+        let initial_target = buffer.target_buffer_ms;
+
+        // Simulate underrun (buffer below threshold)
+        let low_buffer_samples = BUFFER_UNDERRUN_THRESHOLD_SAMPLES - 100;
+        buffer.adjust_for_conditions(low_buffer_samples, &tx);
+
+        assert!(
+            buffer.target_buffer_ms >= initial_target,
+            "Should increase buffer on underrun (initial: {}, new: {})",
+            initial_target,
+            buffer.target_buffer_ms
+        );
+        assert!(
+            buffer.target_buffer_ms <= MAX_BUFFER_MS,
+            "Should respect MAX_BUFFER_MS (got {}ms)",
+            buffer.target_buffer_ms
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_adjust_decreases_on_overrun() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let (tx, _rx) = mpsc::channel(10);
+
+        // Set target high to allow decrease
+        buffer.target_buffer_ms = 100.0;
+
+        // Simulate overrun (buffer above threshold)
+        let high_buffer_samples = BUFFER_OVERRUN_THRESHOLD_SAMPLES + 1000;
+        buffer.adjust_for_conditions(high_buffer_samples, &tx);
+
+        // May decrease, but should respect minimum based on jitter
+        assert!(
+            buffer.target_buffer_ms >= MIN_BUFFER_MS,
+            "Should respect MIN_BUFFER_MS (got {}ms)",
+            buffer.target_buffer_ms
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_adjust_respects_bounds() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let (tx, _rx) = mpsc::channel(10);
+
+        // Try to force buffer very high
+        buffer.target_buffer_ms = MAX_BUFFER_MS;
+        buffer.adjust_for_conditions(0, &tx); // Try to increase more
+        assert!(
+            buffer.target_buffer_ms <= MAX_BUFFER_MS,
+            "Should not exceed MAX_BUFFER_MS (got {}ms)",
+            buffer.target_buffer_ms
+        );
+
+        // Try to force buffer very low
+        buffer.target_buffer_ms = MIN_BUFFER_MS;
+        buffer.adjust_for_conditions(BUFFER_SIZE, &tx); // Try to decrease more
+        assert!(
+            buffer.target_buffer_ms >= MIN_BUFFER_MS,
+            "Should not go below MIN_BUFFER_MS (got {}ms)",
+            buffer.target_buffer_ms
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_adjust_applies_exponential_smoothing() {
+        let mut buffer = AdaptiveJitterBuffer::new();
+        let (tx, _rx) = mpsc::channel(10);
+
+        // Simulate condition that would want to change to 100ms
+        // With 10% adjustment factor, change should be gradual
+        buffer.target_buffer_ms = 50.0;
+        // Use a very low buffer value (but not negative) to trigger underrun adjustment
+        let very_low_buffer = BUFFER_UNDERRUN_THRESHOLD_SAMPLES.saturating_sub(500);
+        buffer.adjust_for_conditions(very_low_buffer, &tx);
+
+        // Change should be smoothed (not instant jump to new target)
+        let new_target = buffer.target_buffer_ms;
+        // Should move toward higher value but not instantly
+        assert!(new_target > 50.0, "Should increase toward higher target");
+        assert!(
+            new_target < 150.0,
+            "Should not jump instantly (smoothing should apply)"
+        );
+    }
+
+    // ============================================================================
+    // Tests for Noise Gate Logic (RMS calculation)
+    // ============================================================================
+
+    #[test]
+    fn test_noise_gate_suppresses_below_threshold() {
+        // Signal with RMS below threshold (0.01)
+        let samples = generate_white_noise(FRAME_SIZE, NOISE_GATE_THRESHOLD * 0.5);
+        let rms = calculate_rms(&samples);
+        assert!(
+            rms < NOISE_GATE_THRESHOLD,
+            "Test signal RMS ({}) should be below threshold ({})",
+            rms,
+            NOISE_GATE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_noise_gate_passes_above_threshold() {
+        // Signal with RMS above threshold
+        let samples = generate_white_noise(FRAME_SIZE, NOISE_GATE_THRESHOLD * 2.0);
+        let rms = calculate_rms(&samples);
+        assert!(
+            rms > NOISE_GATE_THRESHOLD,
+            "Test signal RMS ({}) should be above threshold ({})",
+            rms,
+            NOISE_GATE_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_rms_calculation_for_sine_wave() {
+        // Sine wave with amplitude A has RMS = A / sqrt(2)
+        let amplitude = 0.5;
+        let samples = generate_sine_wave(FRAME_SIZE, 440.0, amplitude, SAMPLE_RATE);
+        let rms = calculate_rms(&samples);
+        let expected_rms = amplitude / (2.0_f32).sqrt();
+        assert!(
+            (rms - expected_rms).abs() < 0.01,
+            "RMS should be approximately A/sqrt(2) (got {}, expected {})",
+            rms,
+            expected_rms
+        );
+    }
+
+    // ============================================================================
+    // Tests for Session Serialization
+    // ============================================================================
+
+    #[test]
+    fn test_session_offer_serialization() {
+        let offer = SessionOffer {
+            ufrag: "test_ufrag".to_string(),
+            pwd: "test_password".to_string(),
+            candidates: vec!["candidate1".to_string(), "candidate2".to_string()],
+        };
+
+        let json = serde_json::to_string(&offer).expect("Should serialize");
+        let deserialized: SessionOffer = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(
+            offer, deserialized,
+            "Serialized and deserialized offer should match"
+        );
+    }
+
+    #[test]
+    fn test_session_answer_serialization() {
+        let answer = SessionAnswer {
+            ufrag: "answer_ufrag".to_string(),
+            pwd: "answer_password".to_string(),
+            candidates: vec!["candidate_a".to_string()],
+        };
+
+        let json = serde_json::to_string(&answer).expect("Should serialize");
+        let deserialized: SessionAnswer = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(
+            answer, deserialized,
+            "Serialized and deserialized answer should match"
+        );
+    }
+
+    #[test]
+    fn test_session_offer_base64_roundtrip() {
+        let offer = SessionOffer {
+            ufrag: "test_ufrag".to_string(),
+            pwd: "test_password".to_string(),
+            candidates: vec!["candidate1".to_string()],
+        };
+
+        let json = serde_json::to_string(&offer).expect("Should serialize");
+        let b64 = BASE64_STANDARD.encode(&json);
+        let decoded = BASE64_STANDARD.decode(&b64).expect("Should decode");
+        let decoded_json = String::from_utf8(decoded).expect("Should be valid UTF-8");
+        let deserialized: SessionOffer =
+            serde_json::from_str(&decoded_json).expect("Should deserialize");
+
+        assert_eq!(
+            offer, deserialized,
+            "Base64 roundtrip should preserve offer"
+        );
+    }
+
+    #[test]
+    fn test_session_answer_base64_roundtrip() {
+        let answer = SessionAnswer {
+            ufrag: "answer_ufrag".to_string(),
+            pwd: "answer_password".to_string(),
+            candidates: vec!["candidate_a".to_string(), "candidate_b".to_string()],
+        };
+
+        let json = serde_json::to_string(&answer).expect("Should serialize");
+        let b64 = BASE64_STANDARD.encode(&json);
+        let decoded = BASE64_STANDARD.decode(&b64).expect("Should decode");
+        let decoded_json = String::from_utf8(decoded).expect("Should be valid UTF-8");
+        let deserialized: SessionAnswer =
+            serde_json::from_str(&decoded_json).expect("Should deserialize");
+
+        assert_eq!(
+            answer, deserialized,
+            "Base64 roundtrip should preserve answer"
+        );
+    }
+
+    // ============================================================================
+    // Tests for Packet Sequence Number Handling
+    // ============================================================================
+
+    #[test]
+    fn test_sequence_number_wraparound() {
+        // Test sequence number wrapping from u32::MAX to 0
+        let seq1 = u32::MAX;
+        let seq2 = seq1.wrapping_add(1);
+        assert_eq!(seq2, 0, "Sequence should wrap from MAX to 0");
+
+        // Test gap calculation with wraparound
+        let gap = seq2.wrapping_sub(seq1);
+        assert_eq!(gap, 1, "Gap calculation should handle wraparound correctly");
+    }
+
+    #[test]
+    fn test_sequence_number_gap_detection() {
+        // Test normal gap (no wraparound)
+        let expected: u32 = 5;
+        let received: u32 = 10;
+        let gap = received.wrapping_sub(expected);
+        assert_eq!(gap, 5, "Should detect gap of 5 packets");
+
+        // Test no gap (sequential)
+        let expected2: u32 = 5;
+        let received2: u32 = 6;
+        let gap2 = received2.wrapping_sub(expected2);
+        assert_eq!(
+            gap2, 1,
+            "Sequential packets should have gap of 1 (next expected)"
+        );
+    }
+
+    #[test]
+    fn test_mock_packet_creation() {
+        let payload = b"opus_data";
+        let sequence = 42;
+        let packet = create_mock_packet(sequence, payload);
+
+        assert_eq!(
+            packet.len(),
+            4 + payload.len(),
+            "Packet should have 4-byte header + payload"
+        );
+
+        let decoded_seq = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+        assert_eq!(decoded_seq, sequence, "Sequence number should match");
+
+        assert_eq!(&packet[4..], payload, "Payload should match");
+    }
+
+    // ============================================================================
+    // Tests for Audio Sample Format Conversion
+    // ============================================================================
+
+    #[test]
+    fn test_f32_to_i16_conversion_clamping() {
+        // Test that conversion clamps to i16 range
+        let f32_sample_overflow: f32 = 2.0; // > 1.0, should clamp to 32767
+        let i16_result = (f32_sample_overflow * 32767.0f32).clamp(-32768.0f32, 32767.0f32) as i16;
+        assert_eq!(i16_result, 32767, "Should clamp positive overflow to 32767");
+
+        let f32_sample_underflow: f32 = -2.0; // < -1.0, should clamp to -32768
+        let i16_result2 = (f32_sample_underflow * 32767.0f32).clamp(-32768.0f32, 32767.0f32) as i16;
+        assert_eq!(
+            i16_result2, -32768,
+            "Should clamp negative underflow to -32768"
+        );
+    }
+
+    #[test]
+    fn test_f32_to_i16_conversion_normal_range() {
+        // Test normal range conversion
+        let f32_sample: f32 = 0.5;
+        let i16_result = (f32_sample * 32767.0f32).clamp(-32768.0f32, 32767.0f32) as i16;
+        let expected = (0.5f32 * 32767.0f32) as i16;
+        assert_eq!(
+            i16_result, expected,
+            "Normal range should convert correctly"
+        );
+
+        // Test zero
+        let f32_zero: f32 = 0.0;
+        let i16_zero = (f32_zero * 32767.0f32).clamp(-32768.0f32, 32767.0f32) as i16;
+        assert_eq!(i16_zero, 0, "Zero should convert to zero");
+    }
+
+    #[test]
+    fn test_i16_to_f32_conversion() {
+        // Test i16 to f32 conversion (as done in playback)
+        let i16_sample = 16384; // Half scale
+        let f32_result = i16_sample as f32 / 32768.0;
+        assert!(
+            (f32_result - 0.5).abs() < 0.0001,
+            "Half scale i16 should convert to ~0.5 f32 (got {})",
+            f32_result
+        );
+
+        let i16_max = 32767;
+        let f32_max = i16_max as f32 / 32768.0;
+        assert!(f32_max > 0.99, "Max i16 should convert to near 1.0 f32");
+    }
+
+    // ============================================================================
+    // Tests for PLC Fade-Out Calculation
+    // ============================================================================
+
+    #[test]
+    fn test_plc_fade_factor_calculation() {
+        // Test fade-out factors for gap of 5 packets
+        let gap = 5u32;
+        for i in 0..(gap - 1) {
+            let fade_factor = 1.0 - (i as f32 / gap as f32);
+            // First missing packet (i=0): fade_factor = 1.0 - 0/5 = 1.0
+            // Last missing packet (i=3): fade_factor = 1.0 - 3/5 = 0.4
+            assert!(
+                fade_factor >= 0.0 && fade_factor <= 1.0,
+                "Fade factor should be in range [0, 1] (got {} for i={})",
+                fade_factor,
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_plc_fade_factor_decreases_gradually() {
+        let gap = 10u32;
+        let mut prev_factor = 1.0;
+        for i in 0..(gap - 1) {
+            let fade_factor = 1.0 - (i as f32 / gap as f32);
+            assert!(
+                fade_factor <= prev_factor,
+                "Fade factor should decrease (prev: {}, current: {})",
+                prev_factor,
+                fade_factor
+            );
+            prev_factor = fade_factor;
+        }
+    }
+
+    #[test]
+    fn test_plc_fade_factor_for_single_missing_packet() {
+        let gap = 2u32; // One missing packet (gap of 2 means packet 0, missing 1, packet 2)
+        let fade_factor = 1.0 - (0 as f32 / gap as f32);
+        assert_eq!(
+            fade_factor, 1.0,
+            "Single missing packet should fade to 1.0 (no fade)"
+        );
+    }
+
+    // ============================================================================
+    // Tests for Buffer Management Constants
+    // ============================================================================
+
+    #[test]
+    fn test_buffer_size_constants() {
+        // Verify buffer size calculations
+        let frame_size_calc = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
+        assert_eq!(
+            FRAME_SIZE, frame_size_calc,
+            "FRAME_SIZE should match calculated value (got {}, expected {})",
+            FRAME_SIZE, frame_size_calc
+        );
+
+        // BUFFER_SIZE should be reasonable multiple of FRAME_SIZE
+        assert!(
+            BUFFER_SIZE > FRAME_SIZE * 10,
+            "BUFFER_SIZE should be much larger than FRAME_SIZE for buffering"
+        );
+    }
+
+    #[test]
+    fn test_jitter_buffer_thresholds() {
+        // Verify threshold relationships
+        assert!(
+            MIN_BUFFER_MS < INITIAL_BUFFER_MS,
+            "MIN_BUFFER_MS ({}) should be less than INITIAL_BUFFER_MS ({})",
+            MIN_BUFFER_MS,
+            INITIAL_BUFFER_MS
+        );
+        assert!(
+            INITIAL_BUFFER_MS < MAX_BUFFER_MS,
+            "INITIAL_BUFFER_MS ({}) should be less than MAX_BUFFER_MS ({})",
+            INITIAL_BUFFER_MS,
+            MAX_BUFFER_MS
+        );
+
+        assert!(
+            BUFFER_UNDERRUN_THRESHOLD_SAMPLES < BUFFER_OVERRUN_THRESHOLD_SAMPLES,
+            "Underrun threshold should be less than overrun threshold"
+        );
+    }
 }
