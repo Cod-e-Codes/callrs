@@ -27,15 +27,15 @@ cargo run
 *   **H**: Host a session. Generates a session offer to share.
 *   **C**: Connect to a session. Takes a session offer and generates an answer.
 *   **M**: Mute/unmute microphone (during call only).
-*   **Y**: Copy offer/answer to input field for easy selection (when viewing offer or answer).
+*   **Y**: Copy offer/answer to clipboard (when viewing offer or answer).
 *   **Enter**: Confirm input.
 *   **Esc**: End call, dismiss error, or return to menu.
 *   **Q**: Quit.
 
 ### Connection Flow
 
-1.  **Host**: Press **H**. Press **Y** to copy the generated Session Offer to the input field, then select and copy it to send to the peer.
-2.  **Client**: Press **C**. Paste the Session Offer. Press **Y** to copy the generated Session Answer to the input field, then select and copy it to send back to the host.
+1.  **Host**: Press **H**. Press **Y** to copy the generated Session Offer to your clipboard, then paste it to send to the peer.
+2.  **Client**: Press **C**. Paste the Session Offer (using your terminal's paste: right-click, Ctrl+V, or Ctrl+Shift+V) in the input field, then press **Enter**. Press **Y** to copy the generated Session Answer to your clipboard, then paste it to send back to the host.
 3.  **Host**: Paste the Session Answer.
 4.  Connection establishes automatically.
 5.  **During Call**: Press **M** to toggle microphone mute. The status bar and volume gauge will reflect the mute state.

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use base64::prelude::*;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::{
@@ -952,8 +953,12 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
     );
 
     let help = match &app.mode {
-        AppMode::HostWaitingForAnswer { .. } => " [Y] Copy Offer | [ESC] End | [Q] Quit ",
-        AppMode::ClientGeneratingAnswer { .. } => " [Y] Copy Answer | [ESC] End | [Q] Quit ",
+        AppMode::HostWaitingForAnswer { .. } => {
+            " [Y] Copy Offer to Clipboard | [ESC] End | [Q] Quit "
+        }
+        AppMode::ClientGeneratingAnswer { .. } => {
+            " [Y] Copy Answer to Clipboard | [ESC] End | [Q] Quit "
+        }
         _ => " [H] Host | [C] Connect | [M] Mute | [ESC] End | [Q] Quit ",
     };
     f.render_widget(
@@ -1278,18 +1283,34 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // Copy offer/answer to input field for easy selection
+                        // Copy offer/answer to clipboard
                         (AppMode::HostWaitingForAnswer { offer }, KeyCode::Char('y')) => {
-                            app.input = offer.clone();
-                            app.add_log(
-                                "Offer copied to input field - select and copy from there".into(),
-                            );
+                            match Clipboard::new() {
+                                Ok(mut clipboard) => {
+                                    if let Err(e) = clipboard.set_text(offer.clone()) {
+                                        app.add_log(format!("Failed to copy to clipboard: {}", e));
+                                    } else {
+                                        app.add_log("Offer copied to clipboard!".into());
+                                    }
+                                }
+                                Err(e) => {
+                                    app.add_log(format!("Failed to access clipboard: {}", e));
+                                }
+                            }
                         }
                         (AppMode::ClientGeneratingAnswer { answer }, KeyCode::Char('y')) => {
-                            app.input = answer.clone();
-                            app.add_log(
-                                "Answer copied to input field - select and copy from there".into(),
-                            );
+                            match Clipboard::new() {
+                                Ok(mut clipboard) => {
+                                    if let Err(e) = clipboard.set_text(answer.clone()) {
+                                        app.add_log(format!("Failed to copy to clipboard: {}", e));
+                                    } else {
+                                        app.add_log("Answer copied to clipboard!".into());
+                                    }
+                                }
+                                Err(e) => {
+                                    app.add_log(format!("Failed to access clipboard: {}", e));
+                                }
+                            }
                         }
 
                         // Input handling for connecting/waiting states
