@@ -1329,24 +1329,30 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
 
-    let status = match &app.mode {
-        AppMode::Menu => format!("IDLE | Your IP: {}", app.local_ip),
-        AppMode::IceGathering => "GATHERING ICE...".into(),
-        AppMode::Connecting => "PASTE OFFER...".into(),
-        AppMode::HostWaitingForAnswer { .. } => "WAITING FOR ANSWER (paste below)".into(),
-        AppMode::ClientGeneratingAnswer { .. } => "COPY ANSWER BELOW (send to host)".into(),
-        AppMode::IceConnecting => "CONNECTING...".into(),
-        AppMode::InCall { .. } => {
-            let mute_status = if app.is_muted { " | MUTED" } else { "" };
-            format!(
-                "IN CALL: {} ({}){}",
-                "Connected", app.connection_type, mute_status
-            )
+    let status = if app.should_quit {
+        "SHUTTING DOWN...".into()
+    } else {
+        match &app.mode {
+            AppMode::Menu => format!("IDLE | Your IP: {}", app.local_ip),
+            AppMode::IceGathering => "GATHERING ICE...".into(),
+            AppMode::Connecting => "PASTE OFFER...".into(),
+            AppMode::HostWaitingForAnswer { .. } => "WAITING FOR ANSWER (paste below)".into(),
+            AppMode::ClientGeneratingAnswer { .. } => "COPY ANSWER BELOW (send to host)".into(),
+            AppMode::IceConnecting => "CONNECTING...".into(),
+            AppMode::InCall { .. } => {
+                let mute_status = if app.is_muted { " | MUTED" } else { "" };
+                format!(
+                    "IN CALL: {} ({}){}",
+                    "Connected", app.connection_type, mute_status
+                )
+            }
+            AppMode::Error(msg) => format!("ERROR: {}", msg),
         }
-        AppMode::Error(msg) => format!("ERROR: {}", msg),
     };
 
-    let status_color = if matches!(app.mode, AppMode::Error(_)) {
+    let status_color = if app.should_quit {
+        Color::Magenta
+    } else if matches!(app.mode, AppMode::Error(_)) {
         Color::Red
     } else {
         Color::Yellow
@@ -1690,7 +1696,13 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     match (&app.mode, key.code) {
-                        (_, KeyCode::Char('q')) => app.should_quit = true,
+                        (_, KeyCode::Char('q')) => {
+                            app.should_quit = true;
+                            app.add_log("Shutting down...".into());
+                            let _ = action_tx
+                                .send(AppAction::Log("Cleaning up...".into()))
+                                .await;
+                        }
 
                         // Mute toggle (only during call)
                         (AppMode::InCall { .. }, KeyCode::Char('m')) => {
@@ -2032,8 +2044,17 @@ async fn main() -> Result<()> {
             }
         }
         if app.should_quit {
+            // Render shutdown status before cleanup
+            let _ = terminal.draw(|f| render_ui(f, &app));
+
             // Cleanup UPnP port mapping before exit
+            app.add_log("Cleaning up UPnP port mapping...".into());
+            let _ = terminal.draw(|f| render_ui(f, &app));
             try_upnp_cleanup(9090);
+
+            app.add_log("Goodbye!".into());
+            let _ = terminal.draw(|f| render_ui(f, &app));
+            tokio::time::sleep(Duration::from_millis(200)).await; // Brief pause to show message
             break;
         }
     }
