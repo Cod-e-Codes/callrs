@@ -1327,37 +1327,46 @@ async fn main() -> Result<()> {
                     let (cap_prod, cap_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
                     let (play_prod, play_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
 
-                    if let Ok(audio) = setup_audio(cap_prod, play_cons) {
-                        audio.start();
+                    match setup_audio(cap_prod, play_cons) {
+                        Ok(audio) => {
+                            audio.start();
 
-                        let cap_task = tokio::spawn(capture_processor(
-                            cap_cons,
-                            ntx,
-                            audio.is_active.clone(),
-                            audio.input_sample_rate,
-                            action_tx.clone(),
-                        ));
+                            let cap_task = tokio::spawn(capture_processor(
+                                cap_cons,
+                                ntx,
+                                audio.is_active.clone(),
+                                audio.input_sample_rate,
+                                action_tx.clone(),
+                            ));
 
-                        let net_task = tokio::spawn(run_network(
-                            conn,
-                            nrx,
-                            play_prod,
-                            action_tx.clone(),
-                            audio.is_active.clone(),
-                            audio.output_sample_rate,
-                        ));
+                            let net_task = tokio::spawn(run_network(
+                                conn,
+                                nrx,
+                                play_prod,
+                                action_tx.clone(),
+                                audio.is_active.clone(),
+                                audio.output_sample_rate,
+                            ));
 
-                        session = Some(CallSession {
-                            audio,
-                            capture_task: cap_task,
-                            network_task: net_task,
-                        });
+                            session = Some(CallSession {
+                                audio,
+                                capture_task: cap_task,
+                                network_task: net_task,
+                            });
 
-                        app.mode = AppMode::InCall {
-                            peer: "Connected".into(),
-                            connection_type: app.connection_type.clone(),
-                        };
-                        app.is_muted = false;
+                            app.mode = AppMode::InCall {
+                                peer: "Connected".into(),
+                                connection_type: app.connection_type.clone(),
+                            };
+                            app.is_muted = false;
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Failed to initialize audio: {}", e);
+                            let _ = action_tx.send(AppAction::Log(error_msg.clone())).await;
+                            let _ = action_tx
+                                .send(AppAction::SetMode(AppMode::Error(error_msg)))
+                                .await;
+                        }
                     }
                 }
                 AppAction::Input(key) => {
