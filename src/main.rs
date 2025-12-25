@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
 };
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use serde::{Deserialize, Serialize};
@@ -825,12 +825,20 @@ async fn run_network(
 }
 
 fn render_ui(f: &mut ratatui::Frame, app: &App) {
+    // Allocate more space for offer/answer display when needed
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(5),
+            if matches!(
+                app.mode,
+                AppMode::HostWaitingForAnswer { .. } | AppMode::ClientGeneratingAnswer { .. }
+            ) {
+                Constraint::Min(15) // More space for long offers/answers
+            } else {
+                Constraint::Length(5)
+            },
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -922,23 +930,32 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
     }
 
     let (display_text, title) = match &app.mode {
-        AppMode::HostWaitingForAnswer { offer } => (
-            offer.as_str(),
-            "Your Offer (send to client) | Paste Answer Below:",
-        ),
-        AppMode::ClientGeneratingAnswer { answer } => {
-            (answer.as_str(), "Your Answer (send to host)")
+        AppMode::HostWaitingForAnswer { offer } => {
+            // Display original string - wrapping will handle display, copying will get clean text
+            (
+                offer.clone(),
+                "Your Offer (send to client) | Paste Answer Below:",
+            )
         }
-        AppMode::Error(msg) => (msg.as_str(), "Error (press ESC to dismiss)"),
-        _ => (app.input.as_str(), "Input / Session Data"),
+        AppMode::ClientGeneratingAnswer { answer } => {
+            (answer.clone(), "Your Answer (send to host)")
+        }
+        AppMode::Error(msg) => (msg.clone(), "Error (press ESC to dismiss)"),
+        _ => (app.input.clone(), "Input / Session Data"),
     };
 
     f.render_widget(
-        Paragraph::new(display_text).block(Block::default().title(title).borders(Borders::ALL)),
+        Paragraph::new(display_text)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
         chunks[2],
     );
 
-    let help = " [H] Host | [C] Connect | [M] Mute | [ESC] End | [Q] Quit ";
+    let help = match &app.mode {
+        AppMode::HostWaitingForAnswer { .. } => " [Y] Copy Offer | [ESC] End | [Q] Quit ",
+        AppMode::ClientGeneratingAnswer { .. } => " [Y] Copy Answer | [ESC] End | [Q] Quit ",
+        _ => " [H] Host | [C] Connect | [M] Mute | [ESC] End | [Q] Quit ",
+    };
     f.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         chunks[3],
@@ -1259,6 +1276,20 @@ async fn main() -> Result<()> {
                                     }
                                 });
                             }
+                        }
+
+                        // Copy offer/answer to input field for easy selection
+                        (AppMode::HostWaitingForAnswer { offer }, KeyCode::Char('y')) => {
+                            app.input = offer.clone();
+                            app.add_log(
+                                "Offer copied to input field - select and copy from there".into(),
+                            );
+                        }
+                        (AppMode::ClientGeneratingAnswer { answer }, KeyCode::Char('y')) => {
+                            app.input = answer.clone();
+                            app.add_log(
+                                "Answer copied to input field - select and copy from there".into(),
+                            );
                         }
 
                         // Input handling for connecting/waiting states
