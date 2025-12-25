@@ -54,6 +54,31 @@ const JITTER_ADJUSTMENT_THRESHOLD_MS: f32 = 5.0; // Adjust if jitter exceeds thi
 const BUFFER_UNDERRUN_THRESHOLD_SAMPLES: usize = FRAME_SIZE; // Trigger increase if below this
 const BUFFER_OVERRUN_THRESHOLD_SAMPLES: usize = BUFFER_SIZE / 2; // Trigger decrease if above this
 
+// Jitter buffer adjustment parameters
+const JITTER_BUFFER_ADJUSTMENT_FACTOR: f32 = 0.1; // Exponential smoothing factor (10% change per adjustment)
+const JITTER_BUFFER_REDUCTION_FACTOR: f32 = 0.95; // Factor to reduce buffer when overfull (5% reduction)
+const JITTER_MULTIPLIER: f32 = 3.0; // Multiply jitter by this to calculate required buffer size
+const JITTER_BUFFER_SIGNIFICANT_CHANGE_MS: f32 = 5.0; // Only log adjustments larger than this
+const JITTER_BUFFER_FULLNESS_THRESHOLD: f32 = 1.5; // Buffer is considered overfull at 1.5x target
+const JITTER_BUFFER_ADJUSTMENT_LOG_INTERVAL: u32 = 30; // Log at most every N adjustments
+const JITTER_BUFFER_INTER_ARRIVAL_HISTORY_SIZE: usize = 10; // Number of inter-arrival intervals to track
+const INTER_ARRIVAL_OUTLIER_THRESHOLD_MS: f32 = 500.0; // Ignore intervals larger than this
+
+// Volume calculation
+const VOLUME_NORMALIZATION_FACTOR: f32 = 5.0; // Multiply RMS by this for volume display
+const VOLUME_UPDATE_INTERVAL_MS: u64 = 50; // Update volume display at most every 50ms
+const CAPTURE_PROCESSOR_SLEEP_MS: u64 = 50; // Sleep duration when audio is inactive
+
+// Packet loss concealment
+const MAX_PACKET_GAP_FOR_PLC: u32 = 10; // Maximum gap (packets) to attempt PLC (200ms at 20ms frames)
+
+// UI/Logging
+const MAX_LOG_ENTRIES: usize = 100; // Maximum number of log entries to keep
+const NETWORK_CHANNEL_BUFFER_SIZE: usize = 100; // Buffer size for network message channel
+
+// UPnP configuration
+const UPNP_LEASE_SECONDS: u32 = 3600; // Port mapping lease time (1 hour)
+
 #[derive(Clone, Debug, PartialEq)]
 enum AppMode {
     Menu,
@@ -142,7 +167,7 @@ impl App {
 
     fn add_log(&mut self, msg: String) {
         self.logs.push(msg);
-        if self.logs.len() > 100 {
+        if self.logs.len() > MAX_LOG_ENTRIES {
             self.logs.remove(0);
         }
     }
@@ -359,11 +384,20 @@ fn try_upnp_mapping(local_port: u16) -> Result<String> {
         igd::PortMappingProtocol::UDP,
         local_port, // external port (same as internal for simplicity)
         local_addr,
-        3600, // 1 hour lease
+        UPNP_LEASE_SECONDS,
         "CallRS Voice App",
     ) {
         Ok(_) => Ok(format!("UPnP Success! Port {} mapped.", local_port)),
         Err(e) => Err(anyhow::anyhow!("UPnP Mapping Failed: {}", e)),
+    }
+}
+
+// Helper: Try to remove UPnP port mapping (best effort cleanup)
+fn try_upnp_cleanup(local_port: u16) {
+    use igd::search_gateway;
+    if let Ok(gateway) = search_gateway(Default::default()) {
+        let _ = gateway.remove_port(igd::PortMappingProtocol::UDP, local_port);
+        // Silently ignore errors - cleanup is best effort
     }
 }
 
@@ -575,6 +609,26 @@ async fn client_gather_candidates(
     })
 }
 
+// Helper to send action with error tracking (logs periodically if channel is full)
+fn try_send_action(
+    action_tx: &mpsc::Sender<AppAction>,
+    action: AppAction,
+    dropped_count: &mut u64,
+    last_log: &mut std::time::Instant,
+) {
+    if action_tx.try_send(action).is_err() {
+        *dropped_count += 1;
+        // Log every 100 dropped messages or every 5 seconds, whichever comes first
+        if (*dropped_count).is_multiple_of(100) || last_log.elapsed().as_secs() >= 5 {
+            let _ = action_tx.try_send(AppAction::Log(format!(
+                "Warning: Dropped {} UI update messages (channel full, UI may be lagging)",
+                dropped_count
+            )));
+            *last_log = std::time::Instant::now();
+        }
+    }
+}
+
 async fn capture_processor(
     mut capture_cons: HeapCons<f32>,
     network_tx: mpsc::Sender<Vec<u8>>,
@@ -645,6 +699,8 @@ async fn capture_processor(
     // Flow control / Metrics
     let mut dropped_packets = 0u64;
     let mut last_drop_log = std::time::Instant::now();
+    let mut dropped_ui_messages = 0u64;
+    let mut last_ui_drop_log = std::time::Instant::now();
 
     // For volume calculation
     let mut vol_sum = 0.0;
@@ -653,7 +709,7 @@ async fn capture_processor(
 
     loop {
         if !is_active.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(CAPTURE_PROCESSOR_SLEEP_MS)).await;
             continue;
         }
 
@@ -679,8 +735,12 @@ async fn capture_processor(
                         }
                     }
                     Err(e) => {
-                        let _ =
-                            action_tx.try_send(AppAction::Log(format!("Resample error: {:?}", e)));
+                        try_send_action(
+                            &action_tx,
+                            AppAction::Log(format!("Resample error: {:?}", e)),
+                            &mut dropped_ui_messages,
+                            &mut last_ui_drop_log,
+                        );
                     }
                 }
             }
@@ -699,8 +759,13 @@ async fn capture_processor(
                 // Still update volume display to show silence
                 vol_sum = 0.0;
                 vol_count = frame_size;
-                if last_vol_update.elapsed().as_millis() > 50 {
-                    let _ = action_tx.try_send(AppAction::SetMicVolume(0.0));
+                if last_vol_update.elapsed().as_millis() > VOLUME_UPDATE_INTERVAL_MS as u128 {
+                    try_send_action(
+                        &action_tx,
+                        AppAction::SetMicVolume(0.0),
+                        &mut dropped_ui_messages,
+                        &mut last_ui_drop_log,
+                    );
                     last_vol_update = std::time::Instant::now();
                 }
                 continue; // Skip encoding and sending this frame
@@ -718,9 +783,14 @@ async fn capture_processor(
             // Volume Update
             if vol_count >= frame_size {
                 let avg = vol_sum / vol_count as f32;
-                let vol_normalized = (avg * 5.0).clamp(0.0, 1.0);
-                if last_vol_update.elapsed().as_millis() > 50 {
-                    let _ = action_tx.try_send(AppAction::SetMicVolume(vol_normalized));
+                let vol_normalized = (avg * VOLUME_NORMALIZATION_FACTOR).clamp(0.0, 1.0);
+                if last_vol_update.elapsed().as_millis() > VOLUME_UPDATE_INTERVAL_MS as u128 {
+                    try_send_action(
+                        &action_tx,
+                        AppAction::SetMicVolume(vol_normalized),
+                        &mut dropped_ui_messages,
+                        &mut last_ui_drop_log,
+                    );
                     last_vol_update = std::time::Instant::now();
                 }
                 vol_sum = 0.0;
@@ -743,8 +813,12 @@ async fn capture_processor(
                     sequence = sequence.wrapping_add(1);
                 }
                 Err(e) => {
-                    let _ =
-                        action_tx.try_send(AppAction::Log(format!("Opus encode error: {:?}", e)));
+                    try_send_action(
+                        &action_tx,
+                        AppAction::Log(format!("Opus encode error: {:?}", e)),
+                        &mut dropped_ui_messages,
+                        &mut last_ui_drop_log,
+                    );
                 }
             }
             pcm_buf.clear();
@@ -752,10 +826,15 @@ async fn capture_processor(
 
         // Log drops
         if dropped_packets > 0 && last_drop_log.elapsed().as_secs() >= 5 {
-            let _ = action_tx.try_send(AppAction::Log(format!(
-                "Warning: Dropped {} TX packets (backpressure)",
-                dropped_packets
-            )));
+            try_send_action(
+                &action_tx,
+                AppAction::Log(format!(
+                    "Warning: Dropped {} TX packets (backpressure)",
+                    dropped_packets
+                )),
+                &mut dropped_ui_messages,
+                &mut last_ui_drop_log,
+            );
             dropped_packets = 0;
             last_drop_log = std::time::Instant::now();
         }
@@ -777,7 +856,7 @@ impl AdaptiveJitterBuffer {
         Self {
             target_buffer_ms: INITIAL_BUFFER_MS,
             last_packet_time: None,
-            inter_arrival_times: VecDeque::with_capacity(10), // Keep last 10 intervals
+            inter_arrival_times: VecDeque::with_capacity(JITTER_BUFFER_INTER_ARRIVAL_HISTORY_SIZE),
             adjustment_log_countdown: 0,
         }
     }
@@ -805,10 +884,10 @@ impl AdaptiveJitterBuffer {
     fn record_packet_arrival(&mut self, now: std::time::Instant) {
         if let Some(last_time) = self.last_packet_time {
             let interval_ms = now.duration_since(last_time).as_secs_f32() * 1000.0;
-            if interval_ms > 0.0 && interval_ms < 500.0 {
+            if interval_ms > 0.0 && interval_ms < INTER_ARRIVAL_OUTLIER_THRESHOLD_MS {
                 // Sanity check: ignore outliers
                 self.inter_arrival_times.push_back(interval_ms);
-                if self.inter_arrival_times.len() > 10 {
+                if self.inter_arrival_times.len() > JITTER_BUFFER_INTER_ARRIVAL_HISTORY_SIZE {
                     self.inter_arrival_times.pop_front();
                 }
             }
@@ -827,13 +906,14 @@ impl AdaptiveJitterBuffer {
 
         // Adjust based on measured jitter
         if jitter_ms > JITTER_ADJUSTMENT_THRESHOLD_MS {
-            // Increase buffer to accommodate jitter (target: 3x jitter + base)
-            new_target = (jitter_ms * 3.0 + MIN_BUFFER_MS).min(MAX_BUFFER_MS);
+            // Increase buffer to accommodate jitter (target: multiplier * jitter + base)
+            new_target = (jitter_ms * JITTER_MULTIPLIER + MIN_BUFFER_MS).min(MAX_BUFFER_MS);
         } else if jitter_ms < JITTER_ADJUSTMENT_THRESHOLD_MS * 0.5
-            && current_buffer_ms > self.target_buffer_ms * 1.5
+            && current_buffer_ms > self.target_buffer_ms * JITTER_BUFFER_FULLNESS_THRESHOLD
         {
             // Low jitter and buffer is too full - reduce target for lower latency
-            new_target = (self.target_buffer_ms * 0.95).max(MIN_BUFFER_MS);
+            new_target =
+                (self.target_buffer_ms * JITTER_BUFFER_REDUCTION_FACTOR).max(MIN_BUFFER_MS);
         }
 
         // Adjust based on buffer level (prevent underruns/overflows)
@@ -842,20 +922,20 @@ impl AdaptiveJitterBuffer {
             new_target = (self.target_buffer_ms * 1.1).min(MAX_BUFFER_MS);
         } else if current_buffer_samples > BUFFER_OVERRUN_THRESHOLD_SAMPLES {
             // Buffer is getting too full - decrease target (but not below jitter requirement)
-            let min_for_jitter = (jitter_ms * 3.0 + MIN_BUFFER_MS).min(MAX_BUFFER_MS);
-            new_target = (self.target_buffer_ms * 0.95).max(min_for_jitter.max(MIN_BUFFER_MS));
+            let min_for_jitter = (jitter_ms * JITTER_MULTIPLIER + MIN_BUFFER_MS).min(MAX_BUFFER_MS);
+            new_target = (self.target_buffer_ms * JITTER_BUFFER_REDUCTION_FACTOR)
+                .max(min_for_jitter.max(MIN_BUFFER_MS));
         }
 
-        // Apply exponential smoothing to avoid rapid oscillations (10% change per adjustment)
-        let adjustment_factor = 0.1;
-        new_target =
-            self.target_buffer_ms + (new_target - self.target_buffer_ms) * adjustment_factor;
+        // Apply exponential smoothing to avoid rapid oscillations
+        new_target = self.target_buffer_ms
+            + (new_target - self.target_buffer_ms) * JITTER_BUFFER_ADJUSTMENT_FACTOR;
         new_target = new_target.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
 
         // Only log significant changes
-        if (new_target - self.target_buffer_ms).abs() > 5.0 {
-            self.adjustment_log_countdown = 30; // Log every 30 adjustments max
-            if self.adjustment_log_countdown == 30 {
+        if (new_target - self.target_buffer_ms).abs() > JITTER_BUFFER_SIGNIFICANT_CHANGE_MS {
+            self.adjustment_log_countdown = JITTER_BUFFER_ADJUSTMENT_LOG_INTERVAL;
+            if self.adjustment_log_countdown == JITTER_BUFFER_ADJUSTMENT_LOG_INTERVAL {
                 let _ = action_tx.try_send(AppAction::Log(format!(
                     "Jitter buffer: {:.0}ms -> {:.0}ms (jitter: {:.1}ms)",
                     self.target_buffer_ms, new_target, jitter_ms
@@ -881,7 +961,7 @@ fn calculate_volume(samples: &[f32]) -> f32 {
         return 0.0;
     }
     let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
-    (rms * 5.0).clamp(0.0, 1.0)
+    (rms * VOLUME_NORMALIZATION_FACTOR).clamp(0.0, 1.0)
 }
 
 async fn run_network(
@@ -918,6 +998,8 @@ async fn run_network(
 
     let mut dropped_frames = 0u64;
     let mut last_drop_log = std::time::Instant::now();
+    let mut dropped_ui_messages = 0u64;
+    let mut last_ui_drop_log = std::time::Instant::now();
 
     // Packet loss concealment: track expected sequence number and last frame
     let mut expected_sequence: Option<u32> = None;
@@ -926,10 +1008,15 @@ async fn run_network(
     loop {
         // Log drops
         if dropped_frames > 0 && last_drop_log.elapsed().as_secs() >= 5 {
-            let _ = action_tx.try_send(AppAction::Log(format!(
-                "Warning: Dropped {} RX frames (playback buffer full)",
-                dropped_frames
-            )));
+            try_send_action(
+                &action_tx,
+                AppAction::Log(format!(
+                    "Warning: Dropped {} RX frames (playback buffer full)",
+                    dropped_frames
+                )),
+                &mut dropped_ui_messages,
+                &mut last_ui_drop_log,
+            );
             dropped_frames = 0;
             last_drop_log = std::time::Instant::now();
         }
@@ -957,16 +1044,16 @@ async fn run_network(
                             if let Some(expected) = expected_sequence {
                                 let gap = received_sequence.wrapping_sub(expected);
                                 if gap > 0 {
-                                    if gap > 10 {
+                                    if gap > MAX_PACKET_GAP_FOR_PLC {
                                         // Log significant packet loss (200ms+)
-                                        let _ = action_tx.try_send(AppAction::Log(format!(
+                                        try_send_action(&action_tx, AppAction::Log(format!(
                                             "Warning: Large packet gap detected ({} packets, {}ms+)",
                                             gap,
                                             gap * FRAME_DURATION_MS
-                                        )));
+                                        )), &mut dropped_ui_messages, &mut last_ui_drop_log);
                                     }
-                                    // Handle gaps up to 10 packets (200ms)
-                                    if gap <= 10 {
+                                    // Handle gaps up to MAX_PACKET_GAP_FOR_PLC packets (200ms)
+                                    if gap <= MAX_PACKET_GAP_FOR_PLC {
                                         // Perform PLC: repeat last frame with fade-out for missing packets
                                         if let Some(ref last_frame) = last_decoded_frame {
                                             for i in 0..(gap - 1) {
@@ -979,7 +1066,7 @@ async fn run_network(
 
                                                 // Update receive volume for PLC frames
                                                 let plc_vol = calculate_volume(&faded_frame);
-                                                let _ = action_tx.try_send(AppAction::SetReceiveVolume(plc_vol));
+                                                try_send_action(&action_tx, AppAction::SetReceiveVolume(plc_vol), &mut dropped_ui_messages, &mut last_ui_drop_log);
 
                                                 // Push faded samples (buffer overflow check happens after decode)
                                                 for &sample in &faded_frame {
@@ -990,7 +1077,7 @@ async fn run_network(
                                             }
                                         } else {
                                             // No previous frame, insert silence (zero volume)
-                                            let _ = action_tx.try_send(AppAction::SetReceiveVolume(0.0));
+                                            try_send_action(&action_tx, AppAction::SetReceiveVolume(0.0), &mut dropped_ui_messages, &mut last_ui_drop_log);
                                             for _ in 0..(gap - 1) {
                                                 for _ in 0..FRAME_SIZE {
                                                     if playback_prod.try_push(0.0).is_err() {
@@ -1046,7 +1133,7 @@ async fn run_network(
 
                                     // Calculate receive volume
                                     let receive_vol_normalized = calculate_volume(&frame_f32);
-                                    let _ = action_tx.try_send(AppAction::SetReceiveVolume(receive_vol_normalized));
+                                    try_send_action(&action_tx, AppAction::SetReceiveVolume(receive_vol_normalized), &mut dropped_ui_messages, &mut last_ui_drop_log);
 
                                     // Update last frame for PLC
                                     last_decoded_frame = Some(frame_f32.clone());
@@ -1323,7 +1410,7 @@ async fn main() -> Result<()> {
 
                 AppAction::StartConnection(conn) => {
                     // Setup audio and network
-                    let (ntx, nrx) = mpsc::channel(100);
+                    let (ntx, nrx) = mpsc::channel(NETWORK_CHANNEL_BUFFER_SIZE);
                     let (cap_prod, cap_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
                     let (play_prod, play_cons) = HeapRb::<f32>::new(BUFFER_SIZE).split();
 
@@ -1694,6 +1781,8 @@ async fn main() -> Result<()> {
             }
         }
         if app.should_quit {
+            // Cleanup UPnP port mapping before exit
+            try_upnp_cleanup(9090);
             break;
         }
     }
