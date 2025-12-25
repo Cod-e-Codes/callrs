@@ -51,10 +51,17 @@ enum AppMode {
     Menu,
     Connecting,
     IceGathering,
-    HostWaitingForAnswer { offer: String },
-    ClientGeneratingAnswer { answer: String },
+    HostWaitingForAnswer {
+        offer: String,
+    },
+    ClientGeneratingAnswer {
+        answer: String,
+    },
     IceConnecting,
-    InCall(String),
+    InCall {
+        peer: String,
+        connection_type: String,
+    },
     Error(String),
 }
 
@@ -69,6 +76,8 @@ enum AppAction {
 
     StartConnection(Arc<dyn webrtc_util::Conn + Send + Sync>),
     SetMicVolume(f32),
+    SetReceiveVolume(f32),
+    SetConnectionType(String),
     ToggleMute,
 }
 
@@ -96,6 +105,8 @@ struct App {
     session_answer: Option<String>,
     host_agent_handle: Option<IceAgentHandle>,
     mic_volume: f32,
+    receive_volume: f32,
+    connection_type: String,
     is_muted: bool,
 }
 
@@ -115,6 +126,8 @@ impl App {
             session_answer: None,
             host_agent_handle: None,
             mic_volume: 0.0,
+            receive_volume: 0.0,
+            connection_type: "Unknown".into(),
             is_muted: false,
         }
     }
@@ -824,15 +837,22 @@ async fn run_network(
                                                 dropped_frames += last_frame.len() as u64;
                                                 continue;
                                             }
+                                            // Calculate volume for PLC frames (faded)
+                                            let mut plc_vol_sum = 0.0;
                                             for &sample in last_frame.iter() {
                                                 let faded = sample * fade_factor;
+                                                plc_vol_sum += faded.abs();
                                                 if playback_prod.try_push(faded).is_err() {
                                                     dropped_frames += 1;
                                                 }
                                             }
+                                            // Update receive volume for PLC frames
+                                            let plc_vol = (plc_vol_sum / last_frame.len() as f32 * 5.0).clamp(0.0, 1.0);
+                                            let _ = action_tx.try_send(AppAction::SetReceiveVolume(plc_vol));
                                         }
                                     } else {
-                                        // No previous frame, insert silence
+                                        // No previous frame, insert silence (zero volume)
+                                        let _ = action_tx.try_send(AppAction::SetReceiveVolume(0.0));
                                         for _ in 0..(gap - 1) {
                                             for _ in 0..FRAME_SIZE {
                                                 if playback_prod.try_push(0.0).is_err() {
@@ -868,6 +888,11 @@ async fn run_network(
                                         .iter()
                                         .map(|&s| s as f32 / 32768.0)
                                         .collect();
+
+                                    // Calculate receive volume (RMS)
+                                    let receive_rms = (frame_f32.iter().map(|s| s * s).sum::<f32>() / frame_f32.len() as f32).sqrt();
+                                    let receive_vol_normalized = (receive_rms * 5.0).clamp(0.0, 1.0);
+                                    let _ = action_tx.try_send(AppAction::SetReceiveVolume(receive_vol_normalized));
 
                                     // Update last frame for PLC
                                     last_decoded_frame = Some(frame_f32.clone());
@@ -922,9 +947,12 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         AppMode::HostWaitingForAnswer { .. } => "WAITING FOR ANSWER (paste below)".into(),
         AppMode::ClientGeneratingAnswer { .. } => "COPY ANSWER BELOW (send to host)".into(),
         AppMode::IceConnecting => "CONNECTING...".into(),
-        AppMode::InCall(peer) => {
+        AppMode::InCall { .. } => {
             let mute_status = if app.is_muted { " | MUTED" } else { "" };
-            format!("IN CALL: {}{}", peer, mute_status)
+            format!(
+                "IN CALL: {} ({}){}",
+                "Connected", app.connection_type, mute_status
+            )
         }
         AppMode::Error(msg) => format!("ERROR: {}", msg),
     };
@@ -950,23 +978,36 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         chunks[0],
     );
 
-    if let AppMode::InCall(_) = app.mode {
-        let gauge_color = if app.is_muted {
+    if let AppMode::InCall { .. } = app.mode {
+        let mic_gauge_color = if app.is_muted {
             Color::Red
         } else {
             Color::Green
         };
 
-        let gauge_title = if app.is_muted {
+        let mic_gauge_title = if app.is_muted {
             "Mic Volume (MUTED)"
         } else {
             "Mic Volume"
         };
 
-        let gauge = Gauge::default()
-            .block(Block::default().title(gauge_title).borders(Borders::ALL))
-            .gauge_style(Style::default().fg(gauge_color))
+        let mic_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title(mic_gauge_title)
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(mic_gauge_color))
             .ratio(app.mic_volume.clamp(0.0, 1.0) as f64);
+
+        let receive_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title("Receive Volume")
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(Color::Blue))
+            .ratio(app.receive_volume.clamp(0.0, 1.0) as f64);
 
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -985,7 +1026,14 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             List::new(logs).block(Block::default().title("Activity").borders(Borders::ALL)),
             inner_chunks[0],
         );
-        f.render_widget(gauge, inner_chunks[1]);
+
+        // Show both volume meters side by side
+        let gauge_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner_chunks[1]);
+        f.render_widget(mic_gauge, gauge_chunks[0]);
+        f.render_widget(receive_gauge, gauge_chunks[1]);
     } else {
         let logs: Vec<ListItem> = app
             .logs
@@ -1093,6 +1141,19 @@ async fn main() -> Result<()> {
                 AppAction::SetMicVolume(vol) => {
                     app.mic_volume = vol;
                 }
+                AppAction::SetReceiveVolume(vol) => {
+                    app.receive_volume = vol;
+                }
+                AppAction::SetConnectionType(conn_type) => {
+                    app.connection_type = conn_type;
+                    // Update InCall mode if we're in a call
+                    if let AppMode::InCall { peer, .. } = &app.mode {
+                        app.mode = AppMode::InCall {
+                            peer: peer.clone(),
+                            connection_type: app.connection_type.clone(),
+                        };
+                    }
+                }
                 AppAction::ToggleMute => {
                     if let Some(ref s) = session {
                         let is_muted = s.audio.toggle_mute();
@@ -1138,7 +1199,10 @@ async fn main() -> Result<()> {
                             network_task: net_task,
                         });
 
-                        app.mode = AppMode::InCall("Connected".into());
+                        app.mode = AppMode::InCall {
+                            peer: "Connected".into(),
+                            connection_type: app.connection_type.clone(),
+                        };
                         app.is_muted = false;
                     }
                 }
@@ -1150,7 +1214,7 @@ async fn main() -> Result<()> {
                         (_, KeyCode::Char('q')) => app.should_quit = true,
 
                         // Mute toggle (only during call)
-                        (AppMode::InCall(_), KeyCode::Char('m')) => {
+                        (AppMode::InCall { .. }, KeyCode::Char('m')) => {
                             let _ = action_tx.send(AppAction::ToggleMute).await;
                         }
 
@@ -1249,11 +1313,27 @@ async fn main() -> Result<()> {
                                                 if let Some(pair) =
                                                     agent_handle.agent.get_selected_candidate_pair()
                                                 {
+                                                    let pair_str = pair.to_string();
                                                     let _ = tx
                                                         .send(AppAction::Log(format!(
                                                             "Connected via: {}",
-                                                            pair
+                                                            pair_str
                                                         )))
+                                                        .await;
+
+                                                    // Extract connection type (Direct vs Relay)
+                                                    let conn_type = if pair_str
+                                                        .to_lowercase()
+                                                        .contains("relay")
+                                                    {
+                                                        "Relay"
+                                                    } else {
+                                                        "Direct"
+                                                    };
+                                                    let _ = tx
+                                                        .send(AppAction::SetConnectionType(
+                                                            conn_type.to_string(),
+                                                        ))
                                                         .await;
                                                 }
 
@@ -1329,11 +1409,27 @@ async fn main() -> Result<()> {
                                                         .agent
                                                         .get_selected_candidate_pair()
                                                     {
+                                                        let pair_str = pair.to_string();
                                                         let _ = tx
                                                             .send(AppAction::Log(format!(
                                                                 "Connected via: {}",
-                                                                pair
+                                                                pair_str
                                                             )))
+                                                            .await;
+
+                                                        // Extract connection type (Direct vs Relay)
+                                                        let conn_type = if pair_str
+                                                            .to_lowercase()
+                                                            .contains("relay")
+                                                        {
+                                                            "Relay"
+                                                        } else {
+                                                            "Direct"
+                                                        };
+                                                        let _ = tx
+                                                            .send(AppAction::SetConnectionType(
+                                                                conn_type.to_string(),
+                                                            ))
                                                             .await;
                                                     }
 
