@@ -79,6 +79,13 @@ const NETWORK_CHANNEL_BUFFER_SIZE: usize = 100; // Buffer size for network messa
 // UPnP configuration
 const UPNP_LEASE_SECONDS: u32 = 3600; // Port mapping lease time (1 hour)
 
+// Resampler configuration
+const RESAMPLER_SINC_LEN: usize = 256; // Sinc interpolation filter length
+const RESAMPLER_F_CUTOFF: f32 = 0.95; // Cutoff frequency (0.95 = 95% of Nyquist)
+const RESAMPLER_OVERSAMPLING_FACTOR: usize = 128; // Oversampling factor for quality
+const RESAMPLER_CHUNK_SIZE_OUTPUT: usize = 960; // Output chunk size (~20ms at 48kHz)
+const RESAMPLER_CHUNK_SIZE_INPUT: usize = 1024; // Input chunk size for capture resampling
+
 #[derive(Clone, Debug, PartialEq)]
 enum AppMode {
     Menu,
@@ -276,17 +283,17 @@ fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Res
     let resampler_state: Option<RefCell<(SincFixedIn<f32>, VecDeque<f32>)>> =
         if output_needs_resampling {
             let params = rubato::SincInterpolationParameters {
-                sinc_len: 256,
-                f_cutoff: 0.95,
+                sinc_len: RESAMPLER_SINC_LEN,
+                f_cutoff: RESAMPLER_F_CUTOFF,
                 interpolation: rubato::SincInterpolationType::Linear,
                 window: rubato::WindowFunction::BlackmanHarris2,
-                oversampling_factor: 128,
+                oversampling_factor: RESAMPLER_OVERSAMPLING_FACTOR,
             };
             // Resample FROM 48kHz (buffer) TO output_sample_rate (device)
             // ratio = output_rate / input_rate = output_sample_rate / 48000.0
             let ratio = output_sample_rate as f64 / SAMPLE_RATE as f64;
-            // Input chunk size: approximate 20ms at 48kHz = ~960 samples
-            let chunk_in = 960;
+            // Input chunk size: approximate 20ms at 48kHz
+            let chunk_in = RESAMPLER_CHUNK_SIZE_OUTPUT;
             match SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_in, 1) {
                 Ok(resampler) => Some(RefCell::new((resampler, VecDeque::new()))),
                 Err(e) => {
@@ -659,15 +666,14 @@ async fn capture_processor(
     // Resampler setup
     let mut resampler: Option<SincFixedIn<f32>> = if sample_rate != 48000 {
         let params = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
+            sinc_len: RESAMPLER_SINC_LEN,
+            f_cutoff: RESAMPLER_F_CUTOFF,
             interpolation: rubato::SincInterpolationType::Linear,
             window: rubato::WindowFunction::BlackmanHarris2,
-            oversampling_factor: 128,
+            oversampling_factor: RESAMPLER_OVERSAMPLING_FACTOR,
         };
-        // Input chunk size: try to approximate 20ms or just use something reasonable like 1024
-        // output_needed ~ 960. ratio = 48000 / sample_rate.
-        let chunk_in = 1024;
+        // Input chunk size for capture resampling
+        let chunk_in = RESAMPLER_CHUNK_SIZE_INPUT;
         let ratio = 48000.0 / sample_rate as f64;
         match SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_in, 1) {
             Ok(r) => Some(r),
