@@ -58,6 +58,7 @@ enum AppAction {
     Log(String),
     SetMode(AppMode),
     Input(event::KeyEvent),
+    Paste(String),
     SetOffer(String),
     SetAnswer(String),
     StoreHostAgent(IceAgentHandle),
@@ -978,10 +979,16 @@ async fn main() -> Result<()> {
     let input_tx = action_tx.clone();
     std::thread::spawn(move || {
         loop {
-            if let Ok(true) = event::poll(Duration::from_millis(50))
-                && let Ok(Event::Key(key)) = event::read()
-            {
-                let _ = input_tx.blocking_send(AppAction::Input(key));
+            if let Ok(true) = event::poll(Duration::from_millis(50)) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        let _ = input_tx.blocking_send(AppAction::Input(key));
+                    }
+                    Ok(Event::Paste(text)) => {
+                        let _ = input_tx.blocking_send(AppAction::Paste(text));
+                    }
+                    _ => {}
+                }
             }
         }
     });
@@ -995,6 +1002,15 @@ async fn main() -> Result<()> {
             match action {
                 AppAction::Log(m) => app.add_log(m),
                 AppAction::SetMode(m) => app.mode = m,
+                AppAction::Paste(text) => {
+                    // Append pasted text to input field when in input modes
+                    if matches!(
+                        app.mode,
+                        AppMode::Connecting | AppMode::HostWaitingForAnswer { .. }
+                    ) {
+                        app.input.push_str(&text);
+                    }
+                }
                 AppAction::SetOffer(offer) => {
                     app.session_offer = Some(offer);
                 }
