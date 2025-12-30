@@ -77,6 +77,11 @@ const CAPTURE_PROCESSOR_SLEEP_MS: u64 = 50; // Sleep duration when audio is inac
 // Packet loss concealment
 const MAX_PACKET_GAP_FOR_PLC: u32 = 10; // Maximum gap (packets) to attempt PLC (200ms at 20ms frames)
 
+// Connection recovery
+const CONNECTION_TIMEOUT_SECONDS: u64 = 5; // Consider connection lost if no packets for 5 seconds
+const RECONNECTION_CHECK_INTERVAL_MS: u64 = 500; // Check for reconnection every 500ms
+const MAX_CONSECUTIVE_SEND_ERRORS: u32 = 10; // Max consecutive send errors before considering disconnected
+
 // UI/Logging
 const MAX_LOG_ENTRIES: usize = 100; // Maximum number of log entries to keep
 const NETWORK_CHANNEL_BUFFER_SIZE: usize = 100; // Buffer size for network message channel
@@ -141,6 +146,7 @@ enum AppAction {
     SetPacketLossRate(f32),
     SetCodecBitrate(f32),
     SetConnectionQuality(String),
+    SetConnectionState(String), // "Connected", "Reconnecting", "Disconnected"
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -177,6 +183,7 @@ struct App {
     packet_loss_rate: f32,
     codec_bitrate: f32,
     connection_quality: String,
+    connection_state: String,
 }
 
 impl App {
@@ -204,6 +211,7 @@ impl App {
             packet_loss_rate: 0.0,
             codec_bitrate: 0.0,
             connection_quality: "Unknown".into(),
+            connection_state: "Unknown".into(),
         }
     }
 
@@ -1270,7 +1278,69 @@ async fn run_network(
     const LOSS_RATE_UPDATE_INTERVAL_MS: u64 = 1000; // Update loss rate every second
     const QUALITY_UPDATE_INTERVAL_MS: u64 = 2000; // Update quality every 2 seconds
 
+    // Connection recovery tracking
+    let mut last_packet_received = std::time::Instant::now();
+    let mut consecutive_send_errors = 0u32;
+    let mut connection_state = "Connected";
+    let mut last_connection_check = std::time::Instant::now();
+    let _ = action_tx
+        .send(AppAction::SetConnectionState("Connected".into()))
+        .await;
+
     loop {
+        // Check connection state periodically
+        if last_connection_check.elapsed().as_millis() > RECONNECTION_CHECK_INTERVAL_MS as u128 {
+            let time_since_last_packet = last_packet_received.elapsed().as_secs();
+
+            if time_since_last_packet >= CONNECTION_TIMEOUT_SECONDS {
+                if connection_state != "Disconnected" {
+                    connection_state = "Disconnected";
+                    let _ = action_tx
+                        .send(AppAction::SetConnectionState("Disconnected".into()))
+                        .await;
+                    let _ = action_tx
+                        .send(AppAction::Log(format!(
+                            "Connection lost: No packets received for {} seconds",
+                            time_since_last_packet
+                        )))
+                        .await;
+                }
+            } else if connection_state == "Disconnected" {
+                // Connection recovered
+                connection_state = "Connected";
+                let _ = action_tx
+                    .send(AppAction::SetConnectionState("Connected".into()))
+                    .await;
+                let _ = action_tx
+                    .send(AppAction::Log("Connection restored!".into()))
+                    .await;
+                consecutive_send_errors = 0; // Reset error counter on recovery
+            } else if consecutive_send_errors >= MAX_CONSECUTIVE_SEND_ERRORS {
+                if connection_state != "Reconnecting" {
+                    connection_state = "Reconnecting";
+                    let _ = action_tx
+                        .send(AppAction::SetConnectionState("Reconnecting".into()))
+                        .await;
+                    let _ = action_tx
+                        .send(AppAction::Log(format!(
+                            "Connection issues detected: {} consecutive send errors",
+                            consecutive_send_errors
+                        )))
+                        .await;
+                }
+            } else if connection_state == "Reconnecting" && consecutive_send_errors == 0 {
+                // Recovered from reconnecting state
+                connection_state = "Connected";
+                let _ = action_tx
+                    .send(AppAction::SetConnectionState("Connected".into()))
+                    .await;
+                let _ = action_tx
+                    .send(AppAction::Log("Connection stabilized".into()))
+                    .await;
+            }
+
+            last_connection_check = std::time::Instant::now();
+        }
         // Log drops
         if dropped_frames > 0 && last_drop_log.elapsed().as_secs() >= 5 {
             try_send_action(
@@ -1288,9 +1358,18 @@ async fn run_network(
         tokio::select! {
             Some(data) = network_rx.recv() => {
                 if let Err(e) = conn.send(&data).await {
-                    let _ = action_tx.send(AppAction::Log(
-                        format!("Send error: {}", e)
-                    )).await;
+                    consecutive_send_errors += 1;
+                    // Only log periodically to avoid spam
+                    if consecutive_send_errors.is_multiple_of(10) {
+                        let _ = action_tx.send(AppAction::Log(
+                            format!("Send error ({} consecutive): {}", consecutive_send_errors, e)
+                        )).await;
+                    }
+                } else {
+                    // Reset error counter on successful send
+                    if consecutive_send_errors > 0 {
+                        consecutive_send_errors = 0;
+                    }
                 }
             }
             res = conn.recv(&mut buf) => {
@@ -1325,6 +1404,12 @@ async fn run_network(
 
                         // Track received packet
                         total_packets_received += 1;
+                        last_packet_received = std::time::Instant::now();
+
+                        // Reset send error counter on successful receive
+                        if consecutive_send_errors > 0 {
+                            consecutive_send_errors = 0;
+                        }
 
                         // Packet Loss Concealment: detect missing packets
                         if let Some(expected) = expected_sequence {
@@ -1493,10 +1578,28 @@ async fn run_network(
                             }
                     }
                     Err(e) => {
-                        let _ = action_tx.send(AppAction::Log(
-                            format!("Recv error: {}", e)
-                        )).await;
-                        break;
+                        // Don't break on recv error - keep trying to recover
+                        // Only log periodically to avoid spam
+                        let time_since_last_packet = last_packet_received.elapsed().as_secs();
+                        if time_since_last_packet >= CONNECTION_TIMEOUT_SECONDS {
+                            // Only log if we're already in a disconnected state
+                            if connection_state == "Disconnected" {
+                                // Log at most once per second
+                                if last_connection_check.elapsed().as_secs() >= 1 {
+                                    let _ = action_tx.send(AppAction::Log(
+                                        format!("Recv error (connection lost): {}", e)
+                                    )).await;
+                                    last_connection_check = std::time::Instant::now();
+                                }
+                            }
+                        } else {
+                            // Temporary error, log it
+                            let _ = action_tx.send(AppAction::Log(
+                                format!("Recv error (retrying): {}", e)
+                            )).await;
+                        }
+                        // Continue loop to keep trying
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -1535,9 +1638,14 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             AppMode::IceConnecting => "CONNECTING...".into(),
             AppMode::InCall { .. } => {
                 let mute_status = if app.is_muted { " | MUTED" } else { "" };
+                let conn_status = if app.connection_state.as_str() == "Connected" {
+                    String::new()
+                } else {
+                    format!(" | {}", app.connection_state)
+                };
                 format!(
-                    "IN CALL: {} ({}){}",
-                    "Connected", app.connection_type, mute_status
+                    "IN CALL: {} ({}){}{}",
+                    "Connected", app.connection_type, conn_status, mute_status
                 )
             }
             AppMode::DeviceSelection { .. } => "SELECT AUDIO DEVICES".into(),
@@ -1549,6 +1657,14 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         Color::Magenta
     } else if matches!(app.mode, AppMode::Error(_)) {
         Color::Red
+    } else if matches!(app.mode, AppMode::InCall { .. }) {
+        // Color based on connection state during call
+        match app.connection_state.as_str() {
+            "Disconnected" => Color::Red,
+            "Reconnecting" => Color::Yellow,
+            "Connected" => Color::Green,
+            _ => Color::Yellow,
+        }
     } else {
         Color::Yellow
     };
@@ -2000,6 +2116,9 @@ async fn main() -> Result<()> {
                 }
                 AppAction::SetConnectionQuality(quality) => {
                     app.connection_quality = quality;
+                }
+                AppAction::SetConnectionState(state) => {
+                    app.connection_state = state;
                 }
                 AppAction::SetConnectionType(conn_type) => {
                     app.connection_type = conn_type;
