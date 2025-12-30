@@ -112,6 +112,11 @@ enum AppMode {
         peer: String,
         connection_type: String,
     },
+    DeviceSelection {
+        input_selection: usize,
+        output_selection: usize,
+        selecting_input: bool, // true for input, false for output
+    },
     Error(String),
 }
 
@@ -164,6 +169,8 @@ struct App {
     current_latency_ms: f32,
     connection_type: String,
     is_muted: bool,
+    selected_input_device: Option<String>,
+    selected_output_device: Option<String>,
 }
 
 impl App {
@@ -186,6 +193,8 @@ impl App {
             current_latency_ms: 0.0,
             connection_type: "Unknown".into(),
             is_muted: false,
+            selected_input_device: None,
+            selected_output_device: None,
         }
     }
 
@@ -233,13 +242,78 @@ impl CallSession {
     }
 }
 
-fn setup_audio(capture_prod: HeapProd<f32>, playback_cons: HeapCons<f32>) -> Result<AudioHandle> {
+// Enumerate available audio devices
+fn enumerate_input_devices() -> Result<Vec<(String, cpal::Device)>> {
+    let host = cpal::default_host();
+    let mut devices = Vec::new();
+
+    for device in host.input_devices()? {
+        let name = device
+            .description()
+            .map(|desc| format!("{}", desc))
+            .unwrap_or_else(|_| "Unknown Device".to_string());
+        devices.push((name, device));
+    }
+
+    Ok(devices)
+}
+
+fn enumerate_output_devices() -> Result<Vec<(String, cpal::Device)>> {
+    let host = cpal::default_host();
+    let mut devices = Vec::new();
+
+    for device in host.output_devices()? {
+        let name = device
+            .description()
+            .map(|desc| format!("{}", desc))
+            .unwrap_or_else(|_| "Unknown Device".to_string());
+        devices.push((name, device));
+    }
+
+    Ok(devices)
+}
+
+// Find a device by name, or return default if name is None
+fn find_input_device(host: &cpal::Host, device_name: Option<&String>) -> Result<cpal::Device> {
+    if let Some(name) = device_name {
+        for device in host.input_devices()? {
+            if let Ok(dev_desc) = device.description()
+                && format!("{}", dev_desc) == *name
+            {
+                return Ok(device);
+            }
+        }
+        return Err(anyhow::anyhow!("Input device '{}' not found", name));
+    }
+    host.default_input_device().context("No input device")
+}
+
+fn find_output_device(host: &cpal::Host, device_name: Option<&String>) -> Result<cpal::Device> {
+    if let Some(name) = device_name {
+        for device in host.output_devices()? {
+            if let Ok(dev_desc) = device.description()
+                && format!("{}", dev_desc) == *name
+            {
+                return Ok(device);
+            }
+        }
+        return Err(anyhow::anyhow!("Output device '{}' not found", name));
+    }
+    host.default_output_device().context("No output device")
+}
+
+fn setup_audio(
+    capture_prod: HeapProd<f32>,
+    playback_cons: HeapCons<f32>,
+    input_device_name: Option<&String>,
+    output_device_name: Option<&String>,
+) -> Result<AudioHandle> {
     let host = cpal::default_host();
     let is_active = Arc::new(AtomicBool::new(false));
     let is_muted = Arc::new(AtomicBool::new(false));
 
-    let input_dev = host.default_input_device().context("No input device")?;
-    let output_dev = host.default_output_device().context("No output device")?;
+    let input_dev = find_input_device(&host, input_device_name)?;
+    let output_dev = find_output_device(&host, output_device_name)?;
 
     // Try to find a 48kHz config
     let in_cfg = input_dev
@@ -1346,6 +1420,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
                     "Connected", app.connection_type, mute_status
                 )
             }
+            AppMode::DeviceSelection { .. } => "SELECT AUDIO DEVICES".into(),
             AppMode::Error(msg) => format!("ERROR: {}", msg),
         }
     };
@@ -1454,6 +1529,121 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             .gauge_style(Style::default().fg(latency_color))
             .ratio(latency_ratio);
         f.render_widget(latency_gauge, gauge_chunks[1]);
+    } else if let AppMode::DeviceSelection {
+        input_selection,
+        output_selection,
+        selecting_input,
+    } = &app.mode
+    {
+        // Device selection UI
+        let device_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+
+        // Input devices list
+        let input_devices = match enumerate_input_devices() {
+            Ok(devices) => devices,
+            Err(e) => {
+                vec![(
+                    format!("Error: {}", e),
+                    cpal::default_host().default_input_device().unwrap(),
+                )]
+            }
+        };
+
+        let input_items: Vec<ListItem> = input_devices
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, _))| {
+                let prefix = if idx == *input_selection && *selecting_input {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if idx == *input_selection && *selecting_input {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if Some(name) == app.selected_input_device.as_ref() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(format!("{}{}", prefix, name)).style(style)
+            })
+            .collect();
+
+        f.render_widget(
+            List::new(input_items)
+                .block(
+                    Block::default()
+                        .title(if *selecting_input {
+                            "Input Device (UP/DOWN: select, ENTER: confirm)"
+                        } else {
+                            "Input Device"
+                        })
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            device_chunks[0],
+        );
+
+        // Output devices list
+        let output_devices = match enumerate_output_devices() {
+            Ok(devices) => devices,
+            Err(e) => {
+                vec![(
+                    format!("Error: {}", e),
+                    cpal::default_host().default_output_device().unwrap(),
+                )]
+            }
+        };
+
+        let output_items: Vec<ListItem> = output_devices
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, _))| {
+                let prefix = if idx == *output_selection && !*selecting_input {
+                    "> "
+                } else {
+                    "  "
+                };
+                let style = if idx == *output_selection && !*selecting_input {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if Some(name) == app.selected_output_device.as_ref() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(format!("{}{}", prefix, name)).style(style)
+            })
+            .collect();
+
+        f.render_widget(
+            List::new(output_items)
+                .block(
+                    Block::default()
+                        .title(if !*selecting_input {
+                            "Output Device (UP/DOWN: select, ENTER: confirm)"
+                        } else {
+                            "Output Device"
+                        })
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            device_chunks[1],
+        );
     } else {
         let logs: Vec<ListItem> = app
             .logs
@@ -1497,6 +1687,17 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             (answer.clone(), "Your Answer (send to host)".to_string())
         }
         AppMode::Error(msg) => (msg.clone(), "Error (press ESC to dismiss)".to_string()),
+        AppMode::DeviceSelection { .. } => {
+            let current_input = app.selected_input_device.as_deref().unwrap_or("Default");
+            let current_output = app.selected_output_device.as_deref().unwrap_or("Default");
+            (
+                format!(
+                    "Current Selection:\n  Input: {}\n  Output: {}\n\n[TAB] Switch between input/output\n[ESC] Back to menu",
+                    current_input, current_output
+                ),
+                "Device Selection".to_string(),
+            )
+        }
         _ => (app.input.clone(), "Input / Session Data".to_string()),
     };
 
@@ -1514,7 +1715,10 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         AppMode::ClientGeneratingAnswer { .. } => {
             " [Y] Copy Answer to Clipboard | [ESC] End | [Q] Quit "
         }
-        _ => " [H] Host | [C] Connect | [M] Mute | [ESC] End | [Q] Quit ",
+        AppMode::DeviceSelection { .. } => {
+            " [UP/DOWN] Navigate | [ENTER] Select | [TAB] Switch | [ESC] Back "
+        }
+        _ => " [H] Host | [C] Connect | [D] Devices | [M] Mute | [ESC] End | [Q] Quit ",
     };
     f.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1647,7 +1851,12 @@ async fn main() -> Result<()> {
                         None
                     };
 
-                    match setup_audio(cap_prod, play_cons) {
+                    match setup_audio(
+                        cap_prod,
+                        play_cons,
+                        app.selected_input_device.as_ref(),
+                        app.selected_output_device.as_ref(),
+                    ) {
                         Ok(audio) => {
                             audio.start();
 
@@ -1872,6 +2081,128 @@ async fn main() -> Result<()> {
                             app.input.clear();
                         }
 
+                        // Device selection: Press 'd' to open device selection
+                        (AppMode::Menu, KeyCode::Char('d')) => {
+                            let input_devices = enumerate_input_devices().unwrap_or_default();
+                            let output_devices = enumerate_output_devices().unwrap_or_default();
+
+                            // Find current selection indices
+                            let input_idx = if let Some(ref selected) = app.selected_input_device {
+                                input_devices
+                                    .iter()
+                                    .position(|(name, _)| name == selected)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+
+                            let output_idx = if let Some(ref selected) = app.selected_output_device
+                            {
+                                output_devices
+                                    .iter()
+                                    .position(|(name, _)| name == selected)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+
+                            app.mode = AppMode::DeviceSelection {
+                                input_selection: input_idx,
+                                output_selection: output_idx,
+                                selecting_input: true,
+                            };
+                        }
+
+                        // Device selection navigation and selection
+                        (AppMode::DeviceSelection { .. }, KeyCode::Up) => {
+                            if let AppMode::DeviceSelection {
+                                ref mut input_selection,
+                                ref mut output_selection,
+                                ref selecting_input,
+                            } = app.mode
+                            {
+                                if *selecting_input {
+                                    let input_devices =
+                                        enumerate_input_devices().unwrap_or_default();
+                                    if *input_selection > 0 {
+                                        *input_selection -= 1;
+                                    } else {
+                                        *input_selection = input_devices.len().saturating_sub(1);
+                                    }
+                                } else {
+                                    let output_devices =
+                                        enumerate_output_devices().unwrap_or_default();
+                                    if *output_selection > 0 {
+                                        *output_selection -= 1;
+                                    } else {
+                                        *output_selection = output_devices.len().saturating_sub(1);
+                                    }
+                                }
+                            }
+                        }
+
+                        (AppMode::DeviceSelection { .. }, KeyCode::Down) => {
+                            if let AppMode::DeviceSelection {
+                                ref mut input_selection,
+                                ref mut output_selection,
+                                ref selecting_input,
+                            } = app.mode
+                            {
+                                if *selecting_input {
+                                    let input_devices =
+                                        enumerate_input_devices().unwrap_or_default();
+                                    if *input_selection < input_devices.len().saturating_sub(1) {
+                                        *input_selection += 1;
+                                    } else {
+                                        *input_selection = 0;
+                                    }
+                                } else {
+                                    let output_devices =
+                                        enumerate_output_devices().unwrap_or_default();
+                                    if *output_selection < output_devices.len().saturating_sub(1) {
+                                        *output_selection += 1;
+                                    } else {
+                                        *output_selection = 0;
+                                    }
+                                }
+                            }
+                        }
+
+                        (AppMode::DeviceSelection { .. }, KeyCode::Tab) => {
+                            if let AppMode::DeviceSelection {
+                                ref mut selecting_input,
+                                ..
+                            } = app.mode
+                            {
+                                *selecting_input = !*selecting_input;
+                            }
+                        }
+
+                        (AppMode::DeviceSelection { .. }, KeyCode::Enter) => {
+                            if let AppMode::DeviceSelection {
+                                input_selection,
+                                output_selection,
+                                selecting_input,
+                            } = &app.mode
+                            {
+                                if *selecting_input {
+                                    let input_devices =
+                                        enumerate_input_devices().unwrap_or_default();
+                                    if let Some((name, _)) = input_devices.get(*input_selection) {
+                                        app.selected_input_device = Some(name.clone());
+                                        app.add_log(format!("Selected input device: {}", name));
+                                    }
+                                } else {
+                                    let output_devices =
+                                        enumerate_output_devices().unwrap_or_default();
+                                    if let Some((name, _)) = output_devices.get(*output_selection) {
+                                        app.selected_output_device = Some(name.clone());
+                                        app.add_log(format!("Selected output device: {}", name));
+                                    }
+                                }
+                            }
+                        }
+
                         // Client pastes offer and generates answer
                         (AppMode::Connecting, KeyCode::Enter) => {
                             if !app.input.is_empty() {
@@ -2022,20 +2353,36 @@ async fn main() -> Result<()> {
 
                         // ESC to cancel/end or dismiss error
                         (_, KeyCode::Esc) => {
-                            if let Some(s) = session.take() {
+                            // If in device selection, just go back to menu
+                            if matches!(app.mode, AppMode::DeviceSelection { .. }) {
+                                app.mode = AppMode::Menu;
+                            } else if let Some(s) = session.take() {
                                 s.stop().await;
-                            }
-                            app.host_agent_handle = None;
+                                app.host_agent_handle = None;
 
-                            // If in error mode, just go back to menu. Otherwise, clear everything.
-                            if matches!(app.mode, AppMode::Error(_)) {
-                                app.mode = AppMode::Menu;
+                                // If in error mode, just go back to menu. Otherwise, clear everything.
+                                if matches!(app.mode, AppMode::Error(_)) {
+                                    app.mode = AppMode::Menu;
+                                } else {
+                                    app.mode = AppMode::Menu;
+                                    app.session_offer = None;
+                                    app.session_answer = None;
+                                    app.input.clear();
+                                    app.is_muted = false;
+                                }
                             } else {
-                                app.mode = AppMode::Menu;
-                                app.session_offer = None;
-                                app.session_answer = None;
-                                app.input.clear();
-                                app.is_muted = false;
+                                app.host_agent_handle = None;
+
+                                // If in error mode, just go back to menu. Otherwise, clear everything.
+                                if matches!(app.mode, AppMode::Error(_)) {
+                                    app.mode = AppMode::Menu;
+                                } else {
+                                    app.mode = AppMode::Menu;
+                                    app.session_offer = None;
+                                    app.session_answer = None;
+                                    app.input.clear();
+                                    app.is_muted = false;
+                                }
                             }
                         }
                         _ => {}
