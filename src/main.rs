@@ -138,6 +138,9 @@ enum AppAction {
     SetLatency(f32),
     SetConnectionType(String),
     ToggleMute,
+    SetPacketLossRate(f32),
+    SetCodecBitrate(f32),
+    SetConnectionQuality(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -171,6 +174,9 @@ struct App {
     is_muted: bool,
     selected_input_device: Option<String>,
     selected_output_device: Option<String>,
+    packet_loss_rate: f32,
+    codec_bitrate: f32,
+    connection_quality: String,
 }
 
 impl App {
@@ -195,6 +201,9 @@ impl App {
             is_muted: false,
             selected_input_device: None,
             selected_output_device: None,
+            packet_loss_rate: 0.0,
+            codec_bitrate: 0.0,
+            connection_quality: "Unknown".into(),
         }
     }
 
@@ -863,6 +872,12 @@ async fn capture_processor(
     let mut vol_count = 0;
     let mut last_vol_update = std::time::Instant::now();
 
+    // Bitrate tracking
+    let mut bitrate_samples: VecDeque<(std::time::Instant, usize)> = VecDeque::new();
+    let mut last_bitrate_update = std::time::Instant::now();
+    const BITRATE_UPDATE_INTERVAL_MS: u64 = 500; // Update bitrate every 500ms
+    const BITRATE_WINDOW_SECONDS: f64 = 2.0; // Calculate average over 2 seconds
+
     loop {
         if !is_active.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(CAPTURE_PROCESSOR_SLEEP_MS)).await;
@@ -986,6 +1001,47 @@ async fn capture_processor(
                     let mut packet = Vec::with_capacity(4 + encrypted_payload.len());
                     packet.extend_from_slice(&sequence.to_le_bytes());
                     packet.extend_from_slice(&encrypted_payload);
+
+                    // Track bitrate: record packet size and timestamp
+                    let now = std::time::Instant::now();
+                    let packet_size_bytes = encrypted_payload.len();
+                    bitrate_samples.push_back((now, packet_size_bytes));
+
+                    // Remove samples older than window
+                    let window_start = now - Duration::from_secs_f64(BITRATE_WINDOW_SECONDS);
+                    while let Some(&(ts, _)) = bitrate_samples.front() {
+                        if ts < window_start {
+                            bitrate_samples.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Calculate and update bitrate periodically
+                    if last_bitrate_update.elapsed().as_millis()
+                        > BITRATE_UPDATE_INTERVAL_MS as u128
+                    {
+                        let total_bytes: usize = bitrate_samples.iter().map(|(_, size)| size).sum();
+                        let time_span_secs = if bitrate_samples.len() > 1 {
+                            let oldest = bitrate_samples.front().unwrap().0;
+                            let newest = bitrate_samples.back().unwrap().0;
+                            newest.duration_since(oldest).as_secs_f64().max(0.001)
+                        } else {
+                            FRAME_DURATION_MS as f64 / 1000.0
+                        };
+                        let bitrate_kbps = if time_span_secs > 0.0 {
+                            ((total_bytes as f64 * 8.0 / time_span_secs) / 1000.0) as f32
+                        } else {
+                            0.0
+                        };
+                        try_send_action(
+                            &action_tx,
+                            AppAction::SetCodecBitrate(bitrate_kbps),
+                            &mut dropped_ui_messages,
+                            &mut last_ui_drop_log,
+                        );
+                        last_bitrate_update = now;
+                    }
 
                     match network_tx.try_send(packet) {
                         Ok(_) => {}
@@ -1206,6 +1262,14 @@ async fn run_network(
     let mut expected_sequence: Option<u32> = None;
     let mut last_decoded_frame: Option<Vec<f32>> = None;
 
+    // Packet loss tracking
+    let mut total_packets_received: u64 = 0;
+    let mut total_packets_lost: u64 = 0;
+    let mut last_loss_rate_update = std::time::Instant::now();
+    let mut last_quality_update = std::time::Instant::now();
+    const LOSS_RATE_UPDATE_INTERVAL_MS: u64 = 1000; // Update loss rate every second
+    const QUALITY_UPDATE_INTERVAL_MS: u64 = 2000; // Update quality every 2 seconds
+
     loop {
         // Log drops
         if dropped_frames > 0 && last_drop_log.elapsed().as_secs() >= 5 {
@@ -1259,10 +1323,16 @@ async fn run_network(
                             buf[4..len].to_vec()
                         };
 
+                        // Track received packet
+                        total_packets_received += 1;
+
                         // Packet Loss Concealment: detect missing packets
                         if let Some(expected) = expected_sequence {
                             let gap = received_sequence.wrapping_sub(expected);
                             if gap > 0 {
+                                // Track lost packets (gap - 1 because we received one)
+                                total_packets_lost += (gap - 1) as u64;
+
                                 if gap > MAX_PACKET_GAP_FOR_PLC {
                                     // Log significant packet loss (200ms+)
                                     try_send_action(&action_tx, AppAction::Log(format!(
@@ -1310,6 +1380,23 @@ async fn run_network(
                         }
                         expected_sequence = Some(received_sequence.wrapping_add(1));
 
+                        // Update packet loss rate periodically
+                        if last_loss_rate_update.elapsed().as_millis() > LOSS_RATE_UPDATE_INTERVAL_MS as u128 {
+                            let total_expected = total_packets_received + total_packets_lost;
+                            let loss_rate = if total_expected > 0 {
+                                (total_packets_lost as f32 / total_expected as f32) * 100.0
+                            } else {
+                                0.0
+                            };
+                            try_send_action(
+                                &action_tx,
+                                AppAction::SetPacketLossRate(loss_rate),
+                                &mut dropped_ui_messages,
+                                &mut last_ui_drop_log,
+                            );
+                            last_loss_rate_update = std::time::Instant::now();
+                        }
+
                         match decoder.decode(Some(&opus_payload), &mut decoded_pcm, false) {
                                 Ok(samples_len) => {
                                     // Record packet arrival for jitter calculation
@@ -1341,6 +1428,39 @@ async fn run_network(
                                     // Calculate and report current latency (buffer level in ms)
                                     let current_latency_ms = (current_buffer_level as f32 / SAMPLE_RATE as f32) * 1000.0;
                                     try_send_action(&action_tx, AppAction::SetLatency(current_latency_ms), &mut dropped_ui_messages, &mut last_ui_drop_log);
+
+                                    // Calculate connection quality periodically
+                                    if last_quality_update.elapsed().as_millis() > QUALITY_UPDATE_INTERVAL_MS as u128 {
+                                        let jitter_ms = jitter_buffer.calculate_jitter_ms();
+                                        let total_expected = total_packets_received + total_packets_lost;
+                                        let loss_rate = if total_expected > 0 {
+                                            (total_packets_lost as f32 / total_expected as f32) * 100.0
+                                        } else {
+                                            0.0
+                                        };
+
+                                        // Quality scoring: Excellent >95% packets, <5ms jitter, <60ms latency
+                                        // Good: >90% packets, <10ms jitter, <100ms latency
+                                        // Fair: >80% packets, <20ms jitter, <150ms latency
+                                        // Poor: otherwise
+                                        let quality = if loss_rate < 5.0 && jitter_ms < 5.0 && current_latency_ms < 60.0 {
+                                            "Excellent"
+                                        } else if loss_rate < 10.0 && jitter_ms < 10.0 && current_latency_ms < 100.0 {
+                                            "Good"
+                                        } else if loss_rate < 20.0 && jitter_ms < 20.0 && current_latency_ms < 150.0 {
+                                            "Fair"
+                                        } else {
+                                            "Poor"
+                                        };
+
+                                        try_send_action(
+                                            &action_tx,
+                                            AppAction::SetConnectionQuality(quality.to_string()),
+                                            &mut dropped_ui_messages,
+                                            &mut last_ui_drop_log,
+                                        );
+                                        last_quality_update = std::time::Instant::now();
+                                    }
 
                                     // Buffer overflow protection (drop if way too full)
                                     if playback_prod.occupied_len() > BUFFER_SIZE * 3 / 4 {
@@ -1481,7 +1601,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(4)])
+            .constraints([Constraint::Min(3), Constraint::Length(9)])
             .split(chunks[1]);
 
         let logs: Vec<ListItem> = app
@@ -1497,10 +1617,14 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             inner_chunks[0],
         );
 
-        // Show volume meters and latency gauge
+        // Show volume meters, quality metrics, and latency gauge
         let gauge_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(3)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ])
             .split(inner_chunks[1]);
 
         // Volume meters side by side
@@ -1510,6 +1634,73 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             .split(gauge_chunks[0]);
         f.render_widget(mic_gauge, volume_chunks[0]);
         f.render_widget(receive_gauge, volume_chunks[1]);
+
+        // Quality metrics section
+        let quality_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+            ])
+            .split(gauge_chunks[1]);
+
+        // Packet loss rate
+        let loss_color = if app.packet_loss_rate < 1.0 {
+            Color::Green
+        } else if app.packet_loss_rate < 5.0 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        let loss_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!("Packet Loss: {:.1}%", app.packet_loss_rate))
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(loss_color))
+            .ratio((app.packet_loss_rate / 20.0).clamp(0.0, 1.0) as f64);
+        f.render_widget(loss_gauge, quality_chunks[0]);
+
+        // Codec bitrate
+        let bitrate_color = if app.codec_bitrate > 20.0 {
+            Color::Green
+        } else if app.codec_bitrate > 10.0 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        let bitrate_gauge = Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!("Bitrate: {:.0} kbps", app.codec_bitrate))
+                    .borders(Borders::ALL),
+            )
+            .gauge_style(Style::default().fg(bitrate_color))
+            .ratio((app.codec_bitrate / 64.0).clamp(0.0, 1.0) as f64);
+        f.render_widget(bitrate_gauge, quality_chunks[1]);
+
+        // Connection quality
+        let quality_color = match app.connection_quality.as_str() {
+            "Excellent" => Color::Green,
+            "Good" => Color::Cyan,
+            "Fair" => Color::Yellow,
+            "Poor" => Color::Red,
+            _ => Color::Gray,
+        };
+        let quality_text = Paragraph::new(app.connection_quality.as_str())
+            .block(
+                Block::default()
+                    .title("Connection Quality")
+                    .borders(Borders::ALL),
+            )
+            .style(
+                Style::default()
+                    .fg(quality_color)
+                    .add_modifier(Modifier::BOLD),
+            );
+        f.render_widget(quality_text, quality_chunks[2]);
 
         // Latency gauge
         let latency_ratio = (app.current_latency_ms / MAX_BUFFER_MS).clamp(0.0, 1.0) as f64;
@@ -1528,7 +1719,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             )
             .gauge_style(Style::default().fg(latency_color))
             .ratio(latency_ratio);
-        f.render_widget(latency_gauge, gauge_chunks[1]);
+        f.render_widget(latency_gauge, gauge_chunks[2]);
     } else if let AppMode::DeviceSelection {
         input_selection,
         output_selection,
@@ -1800,6 +1991,15 @@ async fn main() -> Result<()> {
                 }
                 AppAction::SetLatency(latency_ms) => {
                     app.current_latency_ms = latency_ms;
+                }
+                AppAction::SetPacketLossRate(rate) => {
+                    app.packet_loss_rate = rate;
+                }
+                AppAction::SetCodecBitrate(bitrate) => {
+                    app.codec_bitrate = bitrate;
+                }
+                AppAction::SetConnectionQuality(quality) => {
+                    app.connection_quality = quality;
                 }
                 AppAction::SetConnectionType(conn_type) => {
                     app.connection_type = conn_type;
