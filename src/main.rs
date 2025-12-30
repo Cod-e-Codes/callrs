@@ -1999,7 +1999,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             let current_output = app.selected_output_device.as_deref().unwrap_or("Default");
             (
                 format!(
-                    "Current Selection:\n  Input: {}\n  Output: {}\n\n[TAB] Switch between input/output\n[ESC] Back to menu",
+                    "Current Selection:\n  Input: {}\n  Output: {}\n\n[TAB] Switch between input/output\n[R] Refresh device list\n[ESC] Back to menu",
                     current_input, current_output
                 ),
                 "Device Selection".to_string(),
@@ -2023,7 +2023,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             " [Y] Copy Answer to Clipboard | [ESC] End | [Q] Quit "
         }
         AppMode::DeviceSelection { .. } => {
-            " [UP/DOWN] Navigate | [ENTER] Select | [TAB] Switch | [ESC] Back "
+            " [UP/DOWN] Navigate | [ENTER] Select | [TAB] Switch | [R] Refresh | [ESC] Back "
         }
         _ => " [H] Host | [C] Connect | [D] Devices | [M] Mute | [ESC] End | [Q] Quit ",
     };
@@ -2520,6 +2520,77 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
+                        }
+
+                        // Refresh device list
+                        (AppMode::DeviceSelection { .. }, KeyCode::Char('r'))
+                        | (AppMode::DeviceSelection { .. }, KeyCode::Char('R')) => {
+                            // Extract current state before mutating
+                            let (
+                                current_input_idx,
+                                current_output_idx,
+                                current_input_name,
+                                current_output_name,
+                            ) = if let AppMode::DeviceSelection {
+                                input_selection,
+                                output_selection,
+                                ..
+                            } = &app.mode
+                            {
+                                (
+                                    *input_selection,
+                                    *output_selection,
+                                    app.selected_input_device.clone(),
+                                    app.selected_output_device.clone(),
+                                )
+                            } else {
+                                (0, 0, None, None)
+                            };
+
+                            // Re-enumerate devices
+                            let input_devices = enumerate_input_devices().unwrap_or_default();
+                            let output_devices = enumerate_output_devices().unwrap_or_default();
+
+                            // Calculate new indices
+                            let new_input_idx = if let Some(ref selected_name) = current_input_name
+                            {
+                                input_devices.iter().position(|(name, _)| name == selected_name)
+                                    .unwrap_or_else(|| {
+                                        app.add_log(format!("Previously selected input device '{}' no longer available", selected_name));
+                                        0
+                                    })
+                            } else {
+                                current_input_idx.min(input_devices.len().saturating_sub(1))
+                            };
+
+                            let new_output_idx = if let Some(ref selected_name) =
+                                current_output_name
+                            {
+                                output_devices.iter().position(|(name, _)| name == selected_name)
+                                    .unwrap_or_else(|| {
+                                        app.add_log(format!("Previously selected output device '{}' no longer available", selected_name));
+                                        0
+                                    })
+                            } else {
+                                current_output_idx.min(output_devices.len().saturating_sub(1))
+                            };
+
+                            // Update mode with new indices
+                            if let AppMode::DeviceSelection {
+                                ref mut input_selection,
+                                ref mut output_selection,
+                                ..
+                            } = app.mode
+                            {
+                                *input_selection = new_input_idx;
+                                *output_selection = new_output_idx;
+                            }
+
+                            app.add_log(format!(
+                                "Refreshed device list: {} input, {} output devices",
+                                input_devices.len(),
+                                output_devices.len()
+                            ));
                         }
 
                         // Client pastes offer and generates answer

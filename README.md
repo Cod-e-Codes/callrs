@@ -42,6 +42,7 @@ cargo run
 *   **Enter**: Confirm input or select device.
 *   **Tab**: Switch between input/output device selection.
 *   **Up/Down**: Navigate device list.
+*   **R**: Refresh device list (in device selection).
 *   **Esc**: End call, dismiss error, return to menu, or exit device selection.
 *   **Q**: Quit.
 
@@ -71,7 +72,7 @@ cargo run
 
 *   **Sample Rate Adaptation**: Automatically resamples audio to 48kHz for optimal Opus encoding, regardless of device capabilities, ensuring consistent quality across different hardware.
 
-*   **Audio Device Selection**: Enumerate and select specific input/output audio devices. Choose from all available devices on your system, with the selected devices persisting for the session.
+*   **Audio Device Selection**: Enumerate and select specific input/output audio devices. Choose from all available devices on your system, with the selected devices persisting for the session. Press **R** to refresh the device list if new devices are connected during runtime.
 
 *   **Quality Metrics**: Real-time display of connection quality metrics including packet loss rate, codec bitrate, and overall connection quality (Excellent/Good/Fair/Poor). Metrics are color-coded for quick visual feedback.
 
